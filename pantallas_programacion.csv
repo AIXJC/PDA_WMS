@@ -1,0 +1,14 @@
+Menú,Sub menú,System Type,Dev Side,Archivo,Código Fuente,Área de Proceso,Funcionalidad,Requerimientos,Estatus,Prioridad
+Principal,Home,PDA,Frontend,src/Pages/Dashboard.tsx,Dashboard.tsx,Producción (general),Vista principal con paneles rápidos y accesos a módulos,Mostrar módulos operativos y actividad reciente,Implementado,Alta
+Principal,Scanner,PDA,Frontend,src/Pages/Scanner.tsx,Scanner.tsx,Producción (general),Escaneo industrial con modos único/continuo/masivo,Simular escaneo, mostrar producto y resultados,Implementado,Alta
+Principal,Inventario,PDA,Frontend,src/Pages/Inventory.tsx,Inventory.tsx,Producción (general),Lista de productos con búsqueda y filtros,Buscar por SKU/nombre/ubicación y filtrar stock,Implementado,Alta
+Principal,Reportes,PDA,Frontend,src/Pages/Reports.tsx,Reports.tsx,Producción (general),Panel de reportes y KPIs,Visualizar estadísticas y reportes disponibles,Implementado,Media
+Principal,Notificaciones,PDA,Frontend,src/Pages/Notifications.tsx,Notifications.tsx,Producción (general),Lista de alertas y mensajes operativos,Leer notificaciones y marcar como leídas,Implementado,Media
+Principal,Configuración,PDA,Frontend,src/Pages/Settings.tsx,Settings.tsx,Producción (general),Ajustes de dispositivo, idioma, tema y conectividad,Cambiar idioma/tema, ver PDA info y servidor API,Implementado,Alta
+Operaciones,Órdenes,PDA,Frontend,src/Pages/Orders.tsx,Orders.tsx,Embarques y recibos,Gestión de órdenes de entrada y salida,Detalle de órdenes y estado de items,Implementado,Alta
+Operaciones,Merma,PDA,Frontend,src/Pages/Merma.tsx,Merma.tsx,Embarques y recibos,Registro de pérdidas y daños,Reportar producto dañado y adjuntar evidencia,Implementado,Media
+Operaciones,Transferencias,PDA,Frontend,src/Pages/Transfers.tsx,Transfers.tsx,Embarques y recibos,Gestión de traslado entre ubicaciones,Ver transferencias y confirmar movimientos,Implementado,Media
+Operaciones,Ajustes,PDA,Frontend,src/Pages/Adjustments.tsx,Adjustments.tsx,Producción (general),Ajuste de inventario y contabilización,Registrar discrepancias y motivos de ajuste,Implementado,Media
+Operaciones,Historial,PDA,Frontend,src/Pages/History.tsx,History.tsx,Producción (general),Historial de movimientos e inventarios,Ver timeline de eventos y estados,Implementado,Media
+Operaciones,Conteo Cíclico,PDA,Frontend,src/Pages/CyclicCount.tsx,CyclicCount.tsx,Producción (general),Conteo por zonas con escaneo,Registrar conteos y avance de zonas,Implementado,Media
+Autenticación,Login,PDA,Frontend,src/Pages/Login.tsx,Login.tsx,Producción (general),Acceso de usuario con varios métodos,Login con contraseña/PIN/QR y validación,Implementado,Alta

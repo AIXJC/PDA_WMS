@@ -1,0 +1,53 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    touch-action: manipulation;
+  }
+  
+  body {
+    @apply bg-white text-slate-900 antialiased overflow-hidden;
+    font-family: var(--font-sans);
+  }
+
+  html.dark body {
+    @apply bg-slate-950 text-slate-100;
+  }
+
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* Custom animations for PDA feel */
+.active-scale {
+  @apply active:scale-95 transition-transform duration-100;
+}
+
+/* High contrast focus states for industrial use */
+input:focus {
+  @apply ring-4 ring-blue-500/20;
+}
+
+/* Safe area support */
+.safe-top {
+  padding-top: env(safe-area-inset-top);
+}
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
