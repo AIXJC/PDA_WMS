@@ -17,18 +17,13 @@ type Req = {
 };
 
 type StorageLocation = {
-  storageId: number;
-  rackName: string;
-  rackColumn: string;
-  rackCell: string;
-  availableCapacity: number;
-  locationId?: number;
-  source?: string;
-  locationCode?: string;
-  area?: string;
-  rack?: string;
-  level?: number | string;
-  position?: number | string;
+  StorageID: number;
+  RackName: string;
+  RackColumn: number;
+  RackCell: number;
+  LocationID?: number | null;
+  LocationName?: string;
+  Status?: 'available' | 'occupied';
 };
 
 export const Transfers: React.FC = () => {
@@ -44,6 +39,7 @@ export const Transfers: React.FC = () => {
   const [loadingStorage, setLoadingStorage] = useState(false);
   const [selectedStorageLocation, setSelectedStorageLocation] = useState<StorageLocation | null>(null);
   const [currentRequest, setCurrentRequest] = useState<Req | null>(null);
+  const [quantityInput, setQuantityInput] = useState('');
 
   useEffect(() => { void load(); }, []);
 
@@ -77,19 +73,13 @@ export const Transfers: React.FC = () => {
     }
   }
 
-  async function loadStorageLocations(partNumber: string, quantity: number) {
+  async function loadStorageLocations() {
     setLoadingStorage(true);
     try {
-      const url = `/api/storage-locations/available?partNumber=${encodeURIComponent(partNumber)}&quantity=${quantity}`;
-      const r = await fetch(url);
+      const r = await fetch('/api/storage-locations?limit=500');
       const d = await r.json();
       if (r.ok) {
-        const nextLocations = Array.isArray(d?.storageLocations)
-          ? d.storageLocations
-          : Array.isArray(d?.locations)
-            ? d.locations
-            : [];
-        setStorageLocations(nextLocations);
+        setStorageLocations(Array.isArray(d?.locations) ? d.locations : []);
       } else {
         alert('Error cargando ubicaciones: ' + (d.message || 'Unknown error'));
         setStorageLocations([]);
@@ -108,29 +98,22 @@ export const Transfers: React.FC = () => {
     }
     try {
       await loadLocationNames();
-      // Cargar solicitudes en estado Aprobado (41) o Pendiente (40)
-      const r = await fetch('/api/requests?status=41');
+      // Solo se ejecutan transferencias ya aprobadas por el ERP (estado 41)
+      const r = await fetch('/api/requests?status=41&requestTypeId=2');
       const d = await r.json();
-      const approved = d.requests || [];
-      
-      // También cargar pendientes si aplica
-      const rPending = await fetch('/api/requests?status=40');
-      const dPending = await rPending.json();
-      const pending = dPending.requests || [];
-      
-      // Combinar ambas listas
-      setRequests([...approved, ...pending]);
+      setRequests(d.requests || []);
     } catch (e) {
       console.error(e);
     } finally { if (showLoading) { setLoading(false); } }
   }
 
   async function execute(req: Req) {
-    // Primero mostrar el modal para seleccionar ubicación
+    // Mostrar el modal para seleccionar la ubicación y capturar la cantidad ya movida físicamente
     setCurrentRequest(req);
     setShowStorageModal(true);
     setSelectedStorageLocation(null);
-    await loadStorageLocations(req.PartNumber, req.Quantity);
+    setQuantityInput(String(req.Quantity ?? ''));
+    await loadStorageLocations();
   }
 
   async function executeTransferWithLocation() {
@@ -139,30 +122,37 @@ export const Transfers: React.FC = () => {
       return;
     }
 
-    if (!confirm(`${t('transfers.confirmExecute')}\n${currentRequest.PartNumber} x ${currentRequest.Quantity}\nUbicación: ${selectedStorageLocation.rackName}`)) return;
-    
+    const parsedQuantity = Number(quantityInput);
+    if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
+      alert('Ingresa la cantidad realmente transferida');
+      return;
+    }
+
+    if (!confirm(`${t('transfers.confirmExecute')}\n${currentRequest.PartNumber} x ${parsedQuantity}\nUbicación: ${selectedStorageLocation.RackName}`)) return;
+
     try {
       setExecuting(currentRequest.RequestID);
-      const body = { 
-        regUserId: user?.id || null, 
-        force: true,
-        destinationStorageId: selectedStorageLocation.storageId
+      const body = {
+        regUserId: user?.id || null,
+        destinationStorageId: selectedStorageLocation.StorageID,
+        quantity: parsedQuantity,
       };
-      const r = await fetch(`/api/requests/${currentRequest.RequestID}/execute-transfer`, { 
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' }, 
-        body: JSON.stringify(body) 
+      const r = await fetch(`/api/requests/${currentRequest.RequestID}/execute-transfer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.message || 'Error executing transfer');
-      alert(`OK: movement ${d.movementId}`);
+      const warning = d.mapWarning ? `\n\nAviso: el mapa del ERP no se pudo actualizar (${d.mapWarning}), pero la transferencia sí se confirmó.` : '';
+      alert(`${d.message || 'Transferencia confirmada correctamente.'}${warning}`);
       setShowStorageModal(false);
       notifyAppRefresh('action');
       await load(false);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       alert(message);
-    } finally { 
+    } finally {
       setExecuting(null);
     }
   }
@@ -275,36 +265,43 @@ export const Transfers: React.FC = () => {
               <div className="py-8 text-center text-slate-500">Cargando ubicaciones...</div>
             ) : storageLocations.length === 0 ? (
               <div className="py-8 text-center text-slate-500">
-                No hay ubicaciones disponibles para este producto
+                No hay ubicaciones disponibles
               </div>
             ) : (
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {storageLocations.map((loc) => (
                   <button
-                    key={loc.storageId}
+                    key={loc.StorageID}
                     onClick={() => setSelectedStorageLocation(loc)}
                     className={`w-full rounded-xl p-3 text-left transition-all ${
-                      selectedStorageLocation?.storageId === loc.storageId
+                      selectedStorageLocation?.StorageID === loc.StorageID
                         ? 'bg-blue-600 text-white shadow-lg'
                         : 'bg-slate-50 text-slate-900 border border-slate-200 dark:bg-slate-700 dark:text-slate-100 dark:border-slate-600'
                     }`}
                   >
                     <div className="font-bold">
-                      {loc.locationCode || loc.rackName || `Rack ${loc.storageId}`}
+                      {loc.RackName || `Rack ${loc.StorageID}`}
                     </div>
                     <div className="text-sm opacity-75">
-                      {loc.area ? `${loc.area} • ` : ''}
-                      {loc.rack || loc.rackName || 'Rack'}
-                      {loc.level !== undefined || loc.position !== undefined ? ` • Level ${loc.level ?? '-'} / Pos ${loc.position ?? '-'}` : ''}
-                      {!loc.area && !loc.rack && !loc.level && !loc.position ? `${loc.rackColumn} - ${loc.rackCell}` : ''}
-                    </div>
-                    <div className="text-xs opacity-75">
-                      Capacidad: {loc.availableCapacity}
+                      {loc.LocationName ? `${loc.LocationName} • ` : ''}
+                      Col {loc.RackColumn} - Cel {loc.RackCell}
                     </div>
                   </button>
                 ))}
               </div>
             )}
+
+            <div className="mt-4 space-y-2">
+              <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-1">Cantidad realmente transferida</label>
+              <input
+                type="number"
+                min="0.0001"
+                step="any"
+                value={quantityInput}
+                onChange={(e) => setQuantityInput(e.target.value)}
+                className="w-full bg-white dark:bg-slate-700 border-2 border-slate-100 dark:border-slate-600 rounded-xl py-3 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+              />
+            </div>
 
             <div className="mt-6 flex gap-3">
               <button

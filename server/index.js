@@ -6,6 +6,7 @@ import path from "path";
 import { pool, quoteIdentifier } from "./db.js";
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import * as erpClient from "./erpClient.js";
 
 dotenv.config({ path: "server/.env" });
 dotenv.config();
@@ -80,6 +81,9 @@ app.use("/api", (req, res, next) => {
   if (req.method === 'POST' && (req.path === '/cyclic-count' || req.path.startsWith('/cyclic-count/'))) return next();
   if (req.method === 'POST' && req.path === '/scrap') return next();
   if (req.method === 'POST' && req.path === '/transfers') return next();
+  if (req.method === 'POST' && req.path === '/requests') return next();
+  if (req.method === 'PUT' && /^\/requests\/\d+$/.test(req.path)) return next();
+  if (req.method === 'POST' && /^\/requests\/\d+\/execute-transfer$/.test(req.path)) return next();
 
   if (req.method !== "GET" && req.method !== "OPTIONS") {
     return res.status(405).json({
@@ -221,7 +225,7 @@ app.get("/api/health", asyncRoute(async (_req, res) => {
 
   res.json({
     ok: true,
-    mode: "read-only",
+    mode: "mixed (lectura general + escritura en endpoints específicos, ver /api/modules)",
     database: rows[0]?.db,
     user: rows[0]?.user,
     version: rows[0]?.version,
@@ -249,7 +253,20 @@ app.get("/api/db/tables/:table/columns", asyncRoute(async (req, res) => {
 
 app.get("/api/modules", (_req, res) => {
   res.json({
-    mode: "read-only",
+    mode: "mixed (lectura general + escritura en endpoints específicos)",
+    writeEndpoints: [
+      "POST /api/auth/login",
+      "POST/GET /api/server-config*",
+      "POST /api/orders/inbound/:id/receive",
+      "POST /api/orders/inbound/:id/confirm",
+      "POST /api/cyclic-count",
+      "POST /api/cyclic-count/:id/complete",
+      "POST /api/scrap",
+      "POST /api/transfers",
+      "POST /api/requests",
+      "PUT /api/requests/:id",
+      "POST /api/requests/:id/execute-transfer",
+    ],
     modules: {
       dashboard: ["/api/dashboard"],
       inventory: ["/api/inventory", "/api/inventory/:partNumber"],
@@ -259,6 +276,7 @@ app.get("/api/modules", (_req, res) => {
       outboundOrders: ["/api/orders/outbound", "/api/orders/outbound/:id"],
       transfers: ["/api/transfers"],
       scrap: ["/api/scrap"],
+      requests: ["/api/request-types", "/api/requests", "/api/requests/lots", "/api/requests/:id/execute-transfer"],
       reports: ["/api/reports/summary"],
       settings: ["/api/settings/catalogs"],
     },
@@ -1817,8 +1835,8 @@ app.post("/api/transfers", asyncRoute(async (req, res) => {
         RegUserID,
         ConfirmUserID,
         Comments,
-        LotBarcode,
-        LotSequence
+        OriginalInternalLot,
+        NewInternalLot
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       1,
@@ -1991,8 +2009,8 @@ app.post("/api/scrap", asyncRoute(async (req, res) => {
         RegUserID,
         ConfirmUserID,
         Comments,
-        LotBarcode,
-        LotSequence
+        OriginalInternalLot,
+        NewInternalLot
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       1,
@@ -2028,6 +2046,389 @@ app.post("/api/scrap", asyncRoute(async (req, res) => {
       message: remainingQty > 0
         ? "Merma registrada, pero no hubo stock suficiente para descontar por completo."
         : "Merma registrada correctamente y stock actualizado.",
+    });
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}));
+
+async function getMostRecentInternalLot(partNumber) {
+  if (!partNumber) return null;
+  const rows = await query(`
+    SELECT lot.InternalLot
+    FROM SHIPPING_RECEIVING_LOTS lot
+    LEFT JOIN ERP_PURCHASE_RECEIPT_DETAIL detail ON detail.PurchaseReceiptDetailID = lot.PurchaseReceiptDetailID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.ItemID = detail.ItemID
+    WHERE item.PartNumber = ? AND lot.InternalLot IS NOT NULL
+    ORDER BY lot.RegDate DESC
+    LIMIT 1
+  `, [partNumber]);
+  return rows[0]?.InternalLot || null;
+}
+
+app.get("/api/request-types", asyncRoute(async (_req, res) => {
+  const rows = await query(`
+    SELECT RequestID AS RequestTypeID, RequestType, RequestDescription
+    FROM INVENTORY_REQUEST_TYPES
+    WHERE UseFlag = 1
+    ORDER BY RequestID
+  `);
+  res.json({ count: rows.length, requestTypes: rows });
+}));
+
+app.get("/api/requests", asyncRoute(async (req, res) => {
+  const limit = getLimit(req.query.limit, 100);
+  const clauses = [];
+  const params = [];
+
+  if (req.query.status) {
+    clauses.push("req.RequestStatusID = ?");
+    params.push(Number(req.query.status));
+  }
+  if (req.query.requestTypeId) {
+    clauses.push("req.RequestTypeID = ?");
+    params.push(Number(req.query.requestTypeId));
+  }
+
+  params.push(limit);
+  const rows = await query(`
+    SELECT
+      req.RequestID,
+      req.RequestStatusID,
+      status.StatusCode,
+      status.StatusDescription,
+      req.RequestTypeID,
+      type.RequestType AS RequestTypeName,
+      type.RequestDescription AS RequestTypeDescription,
+      req.PartNumber,
+      item.PartName,
+      item.UnitType,
+      req.Quantity,
+      req.RegDate,
+      req.SubmitDate,
+      req.RegUserID,
+      req.ConfirmUserID,
+      req.RequestName,
+      req.SourceLocationID,
+      req.DestinationLocationID
+    FROM INVENTORY_REQUESTS req
+    LEFT JOIN MES_STATUS status ON status.StatusID = req.RequestStatusID
+    LEFT JOIN INVENTORY_REQUEST_TYPES type ON type.RequestID = req.RequestTypeID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
+    ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+    ORDER BY req.RequestID DESC
+    LIMIT ?
+  `, params);
+
+  res.json({ count: rows.length, requests: rows });
+}));
+
+app.get("/api/requests/lots", asyncRoute(async (req, res) => {
+  const limit = getLimit(req.query.limit, 50);
+  const partNumber = getSearch(req.query.partNumber);
+  const clauses = [];
+  const params = [];
+
+  if (partNumber) {
+    clauses.push("item.PartNumber = ?");
+    params.push(partNumber);
+  }
+
+  params.push(limit);
+  const rows = await query(`
+    SELECT
+      lot.LotReceiveID AS ReceiveID,
+      lot.ProviderLot,
+      lot.InternalLot,
+      lot.ShortInternalLot,
+      lot.Quantity,
+      lot.RegDate,
+      item.PartNumber
+    FROM SHIPPING_RECEIVING_LOTS lot
+    LEFT JOIN ERP_PURCHASE_RECEIPT_DETAIL detail ON detail.PurchaseReceiptDetailID = lot.PurchaseReceiptDetailID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.ItemID = detail.ItemID
+    ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+    ORDER BY lot.RegDate DESC
+    LIMIT ?
+  `, params);
+
+  res.json({ count: rows.length, lots: rows });
+}));
+
+app.post("/api/requests", asyncRoute(async (req, res) => {
+  const {
+    RequestTypeID,
+    PartNumber,
+    Quantity,
+    RegUserID,
+    SourceLocationID,
+    DestinationLocationID,
+  } = req.body || {};
+
+  const normalizedPartNumber = String(PartNumber || '').trim();
+  const parsedQty = Number(Quantity);
+  const parsedTypeId = Number(RequestTypeID);
+  const parsedRegUserId = RegUserID ? Number(RegUserID) : null;
+
+  if (!normalizedPartNumber) {
+    return res.status(400).json({ message: "Debe indicar un producto para la solicitud." });
+  }
+  if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+    return res.status(400).json({ message: "La cantidad debe ser mayor a cero." });
+  }
+  if (!Number.isInteger(parsedTypeId)) {
+    return res.status(400).json({ message: "Debe indicar un tipo de solicitud válido." });
+  }
+  if (!parsedRegUserId) {
+    return res.status(400).json({ message: "No se pudo identificar al usuario que registra la solicitud." });
+  }
+
+  const [typeRows] = await pool.query(
+    "SELECT RequestID FROM INVENTORY_REQUEST_TYPES WHERE RequestID = ? AND UseFlag = 1",
+    [parsedTypeId]
+  );
+  if (!typeRows[0]) {
+    return res.status(400).json({ message: "El tipo de solicitud indicado no es válido." });
+  }
+
+  const isTransfer = parsedTypeId === 2;
+  const normalizedSourceLocationId = SourceLocationID ? Number(SourceLocationID) : null;
+  const normalizedDestinationLocationId = DestinationLocationID ? Number(DestinationLocationID) : null;
+
+  if (isTransfer && (!normalizedSourceLocationId || !normalizedDestinationLocationId)) {
+    return res.status(400).json({ message: "Una transferencia requiere ubicación de origen y destino." });
+  }
+
+  // El ERP valida el request_id releyendo la fila desde la misma base de datos con su
+  // propia conexión, así que el INSERT debe quedar comprometido (COMMIT) ANTES de
+  // llamarlo — de lo contrario el ERP no puede ver una fila todavía no confirmada y
+  // responde "No existe la solicitud". Por eso aquí no se usa una transacción local:
+  // se inserta ya confirmado y, si el ERP rechaza, se revierte con un DELETE
+  // compensatorio en vez de un ROLLBACK.
+  const [insertResult] = await pool.query(`
+    INSERT INTO INVENTORY_REQUESTS (
+      RequestStatusID, RequestTypeID, PartNumber, Quantity,
+      RegUserID, ConfirmUserID, SourceLocationID, DestinationLocationID
+    ) VALUES (40, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    parsedTypeId,
+    normalizedPartNumber,
+    parsedQty,
+    parsedRegUserId,
+    parsedRegUserId,
+    normalizedSourceLocationId,
+    normalizedDestinationLocationId,
+  ]);
+
+  const requestId = insertResult.insertId;
+  let erpResult = null;
+
+  if (isTransfer) {
+    erpResult = await erpClient.createStockEntry(requestId);
+    if (!erpResult.ok) {
+      await pool.query("DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
+      return res.status(502).json({
+        message: `La solicitud no se creó porque el ERP la rechazó: ${erpResult.message}`,
+        erp: erpResult,
+      });
+    }
+  }
+
+  res.status(201).json({
+    ok: true,
+    requestId,
+    erp: erpResult
+      ? { stockEntry: erpResult.data?.stock_entry, stockEntryType: erpResult.data?.stock_entry_type, message: erpResult.message }
+      : null,
+    message: isTransfer
+      ? `Solicitud #${requestId} creada y sincronizada con el ERP correctamente.`
+      : `Solicitud #${requestId} creada correctamente.`,
+  });
+}));
+
+app.put("/api/requests/:id", asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  if (!Number.isInteger(requestId)) {
+    return res.status(400).json({ message: "Identificador de solicitud inválido." });
+  }
+
+  const { PartNumber, Quantity, SourceLocationID, DestinationLocationID } = req.body || {};
+
+  const [existingRows] = await pool.query("SELECT * FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
+  const existing = existingRows[0];
+  if (!existing) {
+    return res.status(404).json({ message: "La solicitud no existe." });
+  }
+  if (Number(existing.RequestStatusID) !== 40) {
+    return res.status(409).json({ message: "Solo se pueden editar solicitudes en estado DRAFT (pendiente)." });
+  }
+
+  const normalizedPartNumber = PartNumber ? String(PartNumber).trim() : String(existing.PartNumber);
+  const parsedQty = Quantity !== undefined && Quantity !== null && Quantity !== '' ? Number(Quantity) : Number(existing.Quantity);
+  if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+    return res.status(400).json({ message: "La cantidad debe ser mayor a cero." });
+  }
+  const normalizedSourceLocationId = SourceLocationID !== undefined
+    ? (SourceLocationID ? Number(SourceLocationID) : null)
+    : existing.SourceLocationID;
+  const normalizedDestinationLocationId = DestinationLocationID !== undefined
+    ? (DestinationLocationID ? Number(DestinationLocationID) : null)
+    : existing.DestinationLocationID;
+
+  const isTransfer = Number(existing.RequestTypeID) === 2;
+  if (isTransfer && (!normalizedSourceLocationId || !normalizedDestinationLocationId)) {
+    return res.status(400).json({ message: "Una transferencia requiere ubicación de origen y destino." });
+  }
+
+  // Mismo motivo que en la creación: el ERP relee la fila con su propia conexión para
+  // sincronizar material/cantidad/ubicaciones, así que el UPDATE debe quedar
+  // comprometido antes de llamarlo. Si el ERP rechaza, se revierte con un UPDATE
+  // compensatorio a los valores previos en vez de un ROLLBACK transaccional.
+  const [updateResult] = await pool.query(`
+    UPDATE INVENTORY_REQUESTS
+    SET PartNumber = ?, Quantity = ?, SourceLocationID = ?, DestinationLocationID = ?
+    WHERE RequestID = ? AND RequestStatusID = 40
+  `, [normalizedPartNumber, parsedQty, normalizedSourceLocationId, normalizedDestinationLocationId, requestId]);
+
+  if (updateResult.affectedRows === 0) {
+    return res.status(409).json({ message: "La solicitud ya no está en estado DRAFT; no se puede actualizar." });
+  }
+
+  let erpResult = null;
+  if (isTransfer) {
+    erpResult = await erpClient.updateStockEntry(requestId);
+    if (!erpResult.ok) {
+      await pool.query(`
+        UPDATE INVENTORY_REQUESTS
+        SET PartNumber = ?, Quantity = ?, SourceLocationID = ?, DestinationLocationID = ?
+        WHERE RequestID = ?
+      `, [existing.PartNumber, existing.Quantity, existing.SourceLocationID, existing.DestinationLocationID, requestId]);
+      return res.status(502).json({
+        message: `No se actualizó la solicitud porque el ERP la rechazó: ${erpResult.message}`,
+        erp: erpResult,
+      });
+    }
+  }
+
+  res.json({
+    ok: true,
+    requestId,
+    erp: erpResult ? { stockEntry: erpResult.data?.stock_entry, message: erpResult.message } : null,
+    message: "Solicitud actualizada correctamente.",
+  });
+}));
+
+app.post("/api/requests/:id/execute-transfer", asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  if (!Number.isInteger(requestId)) {
+    return res.status(400).json({ message: "Identificador de solicitud inválido." });
+  }
+
+  const { destinationStorageId, quantity, regUserId, comments } = req.body || {};
+  const parsedStorageId = Number(destinationStorageId);
+  const parsedQty = Number(quantity);
+  const parsedUserId = regUserId ? Number(regUserId) : null;
+
+  if (!Number.isInteger(parsedStorageId)) {
+    return res.status(400).json({ message: "Debe seleccionar una ubicación de almacenamiento." });
+  }
+  if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+    return res.status(400).json({ message: "La cantidad debe ser mayor a cero." });
+  }
+
+  const [requestRows] = await pool.query("SELECT * FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
+  const requestRow = requestRows[0];
+  if (!requestRow) {
+    return res.status(404).json({ message: "La solicitud no existe." });
+  }
+  if (Number(requestRow.RequestTypeID) !== 2) {
+    return res.status(409).json({ message: "Esta operación solo aplica a solicitudes de Transferencia." });
+  }
+  if (Number(requestRow.RequestStatusID) !== 41) {
+    return res.status(409).json({ message: "La solicitud debe estar aprobada (41) antes de ejecutar la transferencia." });
+  }
+
+  const [storageRows] = await pool.query("SELECT StorageID FROM STORAGE_LOCATIONS WHERE StorageID = ?", [parsedStorageId]);
+  if (!storageRows[0]) {
+    return res.status(404).json({ message: "La ubicación de almacenamiento indicada no existe." });
+  }
+
+  const partNumber = String(requestRow.PartNumber);
+  const batchNo = await getMostRecentInternalLot(partNumber).catch(() => null);
+
+  const mapResult = await erpClient.storeMaterialInRack({
+    storageId: parsedStorageId,
+    partNumber,
+    quantity: parsedQty,
+    batch: batchNo,
+  });
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [existingInventoryRows] = await connection.query(
+      "SELECT InventoryID, Quantity FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? FOR UPDATE",
+      [partNumber, parsedStorageId]
+    );
+
+    if (existingInventoryRows[0]) {
+      await connection.query(
+        "UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?",
+        [parsedQty, existingInventoryRows[0].InventoryID]
+      );
+    } else {
+      await connection.query(
+        "INSERT INTO MES_INVENTORY (PartNumber, RackLocationID, Quantity) VALUES (?, ?, ?)",
+        [partNumber, parsedStorageId, parsedQty]
+      );
+    }
+
+    const submitResult = await erpClient.submitStockEntry({ requestId, quantity: parsedQty, batchNo });
+    if (!submitResult.ok) {
+      await connection.rollback();
+      return res.status(502).json({
+        message: `No se confirmó la transferencia porque el ERP la rechazó: ${submitResult.message}`,
+        erp: submitResult,
+        mapWarning: mapResult.ok ? null : mapResult.message,
+      });
+    }
+
+    const normalizedComments = comments ? String(comments).trim() : null;
+    const [movementResult] = await connection.query(`
+      INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
+        RequestID, PartNumber, StorageID, Quantity, MovementTypeID,
+        SourceLocationID, DestinationLocationID, RegUserID, ConfirmUserID,
+        Comments, OriginalInternalLot, NewInternalLot
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      requestId,
+      partNumber,
+      parsedStorageId,
+      parsedQty,
+      2,
+      requestRow.SourceLocationID,
+      requestRow.DestinationLocationID,
+      parsedUserId || requestRow.RegUserID,
+      parsedUserId || requestRow.RegUserID,
+      normalizedComments,
+      batchNo || partNumber,
+      'TRANSFER',
+    ]);
+
+    await connection.commit();
+
+    res.json({
+      ok: true,
+      movementId: movementResult.insertId,
+      stockEntry: submitResult.data?.stock_entry || null,
+      quantity: parsedQty,
+      batchNo,
+      mapWarning: mapResult.ok ? null : mapResult.message,
+      message: "Transferencia confirmada correctamente.",
     });
   } catch (error) {
     await connection.rollback();
@@ -2406,6 +2807,6 @@ app.use((_req, res) => {
 app.listen(port, host, () => {
   console.log(`[api] Servidor listo en http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/api`);
   console.log(`[api] Escuchando en ${host}:${port}`);
-  console.log("[api] Modo solo lectura: GET habilitado, escrituras bloqueadas");
+  console.log("[api] Modo mixto: GET habilitado en todo /api; escrituras solo en endpoints de la allowlist (ver GET /api/modules)");
 });
 
