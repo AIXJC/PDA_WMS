@@ -1,3 +1,6 @@
 .env
 node_modules
 .npm-cache
+*.pdf
+*.md
+*.sql
