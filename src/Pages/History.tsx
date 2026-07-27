@@ -17,8 +17,13 @@ interface HistoryItem {
   purchaseOrderId?: number;
   acceptedQty?: number;
   rejectedQty?: number;
+  storageQty?: number;
+  quarantineQty?: number;
   receivedQty?: number;
   detailCount?: number;
+  statusLabel?: string;
+  description?: string;
+  isPending?: boolean;
   quantity?: number;
   description?: string;
   locationName?: string;
@@ -40,10 +45,10 @@ export const HistoryPage: React.FC = () => {
       if (showLoading) {
         setError('');
       }
-      const response = await fetch('/api/history/inbound');
+      const response = await fetch('/api/activity-history?limit=100');
       if (!response.ok) throw new Error('No fue posible cargar el historial');
       const data = await response.json();
-      setHistoryItems(Array.isArray(data.history) ? data.history : []);
+      setHistoryItems(Array.isArray(data.activities) ? data.activities : []);
     } catch (err) {
       if (showLoading) {
         setError(err instanceof Error ? err.message : 'Error cargando historial');
@@ -160,10 +165,10 @@ export const HistoryPage: React.FC = () => {
                       item.type === 'scrap' ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-400' :
                       'bg-violet-50 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400'
                     }`}>
-                      {item.type === 'inbound' ? t('history.entry') :
+                      {item.isPending ? 'Recepción pendiente' : (item.type === 'inbound' ? t('history.entry') :
                        item.type === 'outbound' ? t('history.exit') :
                        item.type === 'adjustment' ? t('history.adjustment') :
-                       item.type === 'scrap' ? t('dashboard.scrap') : t('history.transfer')}
+                       item.type === 'scrap' ? t('dashboard.scrap') : t('history.transfer'))}
                     </span>
                     <span className="text-xs font-black text-slate-900 dark:text-slate-100">{item.ref}</span>
                   </div>
@@ -209,12 +214,21 @@ export const HistoryPage: React.FC = () => {
                       </div>
                       <div className="flex items-center gap-2">
                         <CheckCircle2 size={12} className="text-emerald-500" />
-                        <span><span className="font-semibold">Aceptadas:</span> {item.acceptedQty ?? 0}</span>
+                        <span><span className="font-semibold">A storage:</span> {item.storageQty ?? item.acceptedQty ?? 0}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <XCircle size={12} className="text-rose-500" />
-                        <span><span className="font-semibold">Rechazadas:</span> {item.rejectedQty ?? 0}</span>
+                        <span><span className="font-semibold">A cuarentena:</span> {item.quarantineQty ?? item.rejectedQty ?? 0}</span>
                       </div>
+                      {item.isPending ? (
+                        <div className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                          <span className="font-semibold">Estado:</span> {item.statusLabel || 'Recepción pendiente'}
+                        </div>
+                      ) : (
+                        <div className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] text-slate-600 dark:bg-slate-700/60 dark:text-slate-300">
+                          <span className="font-semibold">Propósito:</span> {Number(item.quarantineQty ?? item.rejectedQty ?? 0) > 0 ? 'Se separó cantidad para cuarentena y el resto para almacenamiento.' : 'Se registró la recepción para almacenamiento.'}
+                        </div>
+                      )}
                     </>
                   )}
                   <div className="flex items-center gap-2">

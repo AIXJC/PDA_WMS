@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { useLocation, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowDownCircle,
   ArrowUpCircle,
@@ -73,25 +73,41 @@ const MOCK_ORDER_ITEMS: OrderItem[] = [
 ];
 
 export const Orders: React.FC = () => {
-  const { type } = useParams<{ type: 'inbound' | 'outbound' }>();
+  const { type, detailId } = useParams<{ type: 'inbound' | 'outbound'; detailId?: string }>();
   const location = useLocation();
+  const navigate = useNavigate();
   const [selectedOrder, setSelectedOrder] = useState<string | null>(null);
+  const [inboundView, setInboundView] = useState<'history' | 'detail'>('history');
   const [items] = useState<OrderItem[]>(MOCK_ORDER_ITEMS);
   const [orders, setOrders] = useState<any[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(true);
   const [error, setError] = useState('');
   const [selectedInboundOrder, setSelectedInboundOrder] = useState<InboundOrderSummary | null>(null);
   const [selectedInboundDetails, setSelectedInboundDetails] = useState<InboundOrderDetail[]>([]);
+  const [inboundDetailModalOpen, setInboundDetailModalOpen] = useState(false);
   const [selectedInboundReceipts, setSelectedInboundReceipts] = useState<any[]>([]);
+  const [lotInput, setLotInput] = useState('');
+  const [selectedLot, setSelectedLot] = useState<any | null>(null);
+  const [selectedLotDetails, setSelectedLotDetails] = useState<any | null>(null);
+  const [showLotDetailsModal, setShowLotDetailsModal] = useState(false);
+  const [lotLookupLoading, setLotLookupLoading] = useState(false);
+  const [lotMode, setLotMode] = useState(true);
+  const [availableLots, setAvailableLots] = useState<any[]>([]);
+  const [availableLotsLoading, setAvailableLotsLoading] = useState(false);
   const [selectedOutboundOrder, setSelectedOutboundOrder] = useState<any | null>(null);
   const [selectedOutboundDetails, setSelectedOutboundDetails] = useState<any[]>([]);
   const [selectedOutboundLogs, setSelectedOutboundLogs] = useState<any[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [activeReceiveLineId, setActiveReceiveLineId] = useState<number | null>(null);
   const [scannedCounts, setScannedCounts] = useState<Record<number, number>>({});
+  const [historyFilter, setHistoryFilter] = useState<'all' | 'completed' | 'in-progress' | 'pending'>('all');
   const [showQuarantineModal, setShowQuarantineModal] = useState(false);
   const [quarantineQty, setQuarantineQty] = useState(0);
   const [confirming, setConfirming] = useState(false);
+  const [destinationLocationId, setDestinationLocationId] = useState('');
+  const [sourceLocationId, setSourceLocationId] = useState('');
+  const [sourceLocations, setSourceLocations] = useState<Array<{LocationID:number; LocationName:string}>>([]);
+  const [destinationLocations, setDestinationLocations] = useState<Array<{LocationID:number; LocationName:string}>>([]);
   const [providerFilter, setProviderFilter] = useState('');
   const [poFilter, setPoFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
@@ -102,14 +118,82 @@ export const Orders: React.FC = () => {
   const [selectedStatusId, setSelectedStatusId] = useState<string>('');
   const { user } = useAuthStore();
 
+  const filteredAvailableLots = useMemo(() => {
+    const query = lotInput.trim().toLowerCase();
+    if (!query) return availableLots;
+    return availableLots.filter((lot: any) => {
+      const values = [lot.ProviderLot, lot.InternalLot, lot.ShortInternalLot, lot.ReceiveID?.toString(), lot.LotReceiveID?.toString(), lot.PONumber]
+        .filter(Boolean)
+        .map((value) => String(value).toLowerCase());
+      return values.some((value) => value.includes(query));
+    });
+  }, [availableLots, lotInput]);
+
+  const getInboundOrderStatus = (order: any) => {
+    const ordered = Number(order?.orderedQty ?? 0);
+    const received = Number(order?.receivedQty ?? 0);
+    if (ordered > 0 && received >= ordered) return 'completed';
+    if (ordered > 0 && received > 0 && received < ordered) return 'follow-up';
+    if (received > 0) return 'in-progress';
+    return 'pending';
+  };
+
   const isOutbound = type === 'outbound';
   const title = isOutbound ? 'Órdenes de Salida' : 'Órdenes de Entrada';
+  const searchParams = new URLSearchParams(location.search);
+  const requestedView = searchParams.get('view');
+  const requestedPo = searchParams.get('po');
+  const isInboundDetailRoute = !isOutbound && (
+    Boolean(detailId)
+    || location.pathname.includes('/detail')
+    || requestedView === 'detail'
+    || Boolean(requestedPo)
+  );
+  const isInboundDetailView = !isOutbound && (inboundView === 'detail' || isInboundDetailRoute);
 
   useEffect(() => {
     if (isOutbound) {
       setStatusFilter('');
     }
   }, [isOutbound]);
+
+  useEffect(() => {
+    if (isOutbound) return;
+    if (isInboundDetailRoute) {
+      setInboundView('detail');
+      setInboundDetailModalOpen(true);
+      const purchaseOrderId = Number(detailId || requestedPo);
+      if (Number.isFinite(purchaseOrderId) && purchaseOrderId > 0 && selectedInboundOrder?.PurchaseOrderID !== purchaseOrderId) {
+        void loadInboundOrderDetails(purchaseOrderId, null, { resetLot: true });
+      }
+    } else {
+      setInboundView('history');
+      setInboundDetailModalOpen(false);
+    }
+  }, [isOutbound, isInboundDetailRoute, detailId, requestedPo, location.search]);
+
+  useEffect(() => {
+    if (isOutbound || !selectedInboundOrder) return;
+
+    const loadDestinationLocations = async () => {
+      try {
+        const response = await fetch('/api/scrap/location-options');
+        if (!response.ok) return;
+        const data = await response.json();
+        const nextSourceLocations = Array.isArray(data.sourceLocations) ? data.sourceLocations : [];
+        const nextDestinationLocations = Array.isArray(data.destinationLocations) ? data.destinationLocations : [];
+        setSourceLocations(nextSourceLocations);
+        setDestinationLocations(nextDestinationLocations);
+        if (!sourceLocationId && nextSourceLocations[0]) {
+          setSourceLocationId(String(nextSourceLocations[0].LocationID));
+        }
+      } catch (error) {
+        console.error('No se pudieron cargar las ubicaciones destino', error);
+      }
+    };
+
+    void loadDestinationLocations();
+  }, [isOutbound, selectedInboundOrder]);
 
   useEffect(() => {
     setSelectedOrder(null);
@@ -120,6 +204,7 @@ export const Orders: React.FC = () => {
     setSelectedOutboundDetails([]);
     setSelectedOutboundLogs([]);
     setError('');
+    setLotMode(!isOutbound);
 
     if (isOutbound) {
       const loadOutboundOrders = async () => {
@@ -208,24 +293,137 @@ export const Orders: React.FC = () => {
     }
   }, [isOutbound, requestedStatus, statusOptions, statusFilter]);
 
-  const handleSelectInboundOrder = async (order: InboundOrderSummary) => {
-    setSelectedOrder(String(order.PurchaseOrderID));
-    setSelectedInboundOrder(order);
+  const loadInboundOrderDetails = async (purchaseOrderId: number, orderSummary?: Partial<InboundOrderSummary> | null, options?: { resetLot?: boolean }) => {
+    const { resetLot = true } = options || {};
+    setSelectedOrder(String(purchaseOrderId));
+    setInboundView('detail');
+    setSelectedInboundOrder(orderSummary ? ({ ...orderSummary, PurchaseOrderID: purchaseOrderId } as InboundOrderSummary) : null);
     setSelectedInboundDetails([]);
     setSelectedInboundReceipts([]);
+    if (resetLot) {
+      setSelectedLot(null);
+      setLotInput('');
+    }
+    setLotMode(false);
     setDetailLoading(true);
 
     try {
-      const response = await fetch(`/api/orders/inbound/${order.PurchaseOrderID}`);
+      const response = await fetch(`/api/orders/inbound/${purchaseOrderId}`);
       if (!response.ok) throw new Error('No fue posible cargar el detalle de la entrada');
       const data = await response.json();
-      setSelectedInboundOrder({ ...order, ...(data.order || {}) });
+      setSelectedInboundOrder({ ...(orderSummary || {}), PurchaseOrderID: purchaseOrderId, ...(data.order || {}) } as InboundOrderSummary);
       setSelectedInboundDetails(Array.isArray(data.details) ? data.details : []);
       setSelectedInboundReceipts(Array.isArray(data.receipts) ? data.receipts : []);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error cargando detalle');
     } finally {
       setDetailLoading(false);
+    }
+  };
+
+  const closeInboundDetailView = () => {
+    setInboundDetailModalOpen(false);
+    navigate(`/orders/${type}`);
+    setSelectedOrder(null);
+    setSelectedInboundOrder(null);
+    setSelectedInboundDetails([]);
+    setSelectedInboundReceipts([]);
+    setInboundView('history');
+    setLotMode(true);
+  };
+
+  const handleSelectInboundOrder = async (order: InboundOrderSummary) => {
+    const targetPath = `/orders/${type}/detail/${order.PurchaseOrderID}`;
+    navigate(targetPath);
+    setInboundView('detail');
+    setInboundDetailModalOpen(true);
+    await loadInboundOrderDetails(order.PurchaseOrderID, order, { resetLot: true });
+  };
+
+  const resolveLotPurchaseOrderId = (lot: any) => {
+    const purchaseOrderId = Number(lot?.PurchaseOrderID);
+    const fallbackPurchaseOrderId = Number(lot?.purchaseOrderId || lot?.purchaseOrderID);
+    return Number.isInteger(purchaseOrderId) && purchaseOrderId > 0
+      ? purchaseOrderId
+      : (Number.isInteger(fallbackPurchaseOrderId) && fallbackPurchaseOrderId > 0 ? fallbackPurchaseOrderId : null);
+  };
+
+  const handleSelectLot = async (lot: any) => {
+    setSelectedLot(lot);
+    setSelectedLotDetails(lot);
+    setError('');
+    setLotInput(String(lot?.ProviderLot || lot?.InternalLot || lot?.ShortInternalLot || lot?.ReceiveID || lot?.LotReceiveID || ''));
+
+    const resolvedPurchaseOrderId = resolveLotPurchaseOrderId(lot);
+    if (resolvedPurchaseOrderId) {
+      setLotMode(false);
+      await loadInboundOrderDetails(resolvedPurchaseOrderId, {
+        PurchaseOrderID: resolvedPurchaseOrderId,
+        PONumber: lot?.PONumber || undefined,
+      }, { resetLot: false });
+      return;
+    }
+
+    setLotMode(false);
+  };
+
+  const openLotDetails = (lot: any) => {
+    setSelectedLotDetails(lot);
+    setShowLotDetailsModal(true);
+  };
+
+  const loadAvailableLots = async () => {
+    if (isOutbound) return;
+    setAvailableLotsLoading(true);
+    try {
+      const response = await fetch('/api/requests/lots?limit=20');
+      if (!response.ok) throw new Error('No fue posible cargar los lotes disponibles');
+      const data = await response.json();
+      setAvailableLots(Array.isArray(data.lots) ? data.lots : []);
+    } catch (err) {
+      setAvailableLots([]);
+      setError(err instanceof Error ? err.message : 'No fue posible cargar los lotes disponibles');
+    } finally {
+      setAvailableLotsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (lotMode && !isOutbound) {
+      void loadAvailableLots();
+    }
+  }, [lotMode, isOutbound]);
+
+  const handleLotLookup = async () => {
+    if (!lotInput.trim()) {
+      setError('Escanea o escribe un lote antes de continuar.');
+      return;
+    }
+
+    setLotLookupLoading(true);
+    setError('');
+    try {
+      const response = await fetch(`/api/requests/lots?lotReference=${encodeURIComponent(lotInput.trim())}`);
+      if (!response.ok) throw new Error('No fue posible consultar el lote');
+      const data = await response.json();
+      const matches = Array.isArray(data.lots) ? data.lots : [];
+      const normalized = lotInput.trim().toLowerCase();
+      const found = matches.find((lot: any) => {
+        const values = [lot.ProviderLot, lot.InternalLot, lot.ShortInternalLot, lot.ReceiveID?.toString(), lot.LotReceiveID?.toString()].filter(Boolean).map((val) => String(val).toLowerCase());
+        return values.includes(normalized);
+      }) || matches[0] || null;
+
+      if (!found) {
+        setSelectedLot(null);
+        setError('No se encontró un lote con esa referencia.');
+        return;
+      }
+
+      await handleSelectLot(found);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'No fue posible consultar el lote');
+    } finally {
+      setLotLookupLoading(false);
     }
   };
 
@@ -348,8 +546,13 @@ export const Orders: React.FC = () => {
         body: JSON.stringify({
           scannedDetails,
           quarantineQty,
-            receivedBy: user?.id ? Number(user.id) : undefined,
-            orderStatusId: selectedStatusId ? Number(selectedStatusId) : undefined,
+          receivedBy: user?.id ? Number(user.id) : undefined,
+          orderStatusId: selectedStatusId ? Number(selectedStatusId) : undefined,
+          destinationLocationId: destinationLocationId ? Number(destinationLocationId) : undefined,
+          sourceLocationId: sourceLocationId ? Number(sourceLocationId) : undefined,
+          requestUserId: user?.id ? Number(user.id) : undefined,
+          lotReference: selectedLot?.InternalLot || selectedLot?.ShortInternalLot || selectedLot?.ProviderLot || selectedLot?.LotReceiveID || selectedLot?.ReceiveID || null,
+          comments: `Recepción confirmada desde ${selectedInboundOrder?.PONumber || 'PO'}`,
         }),
       });
 
@@ -488,232 +691,258 @@ export const Orders: React.FC = () => {
     );
   }
 
-  if (selectedOrder && !isOutbound && selectedInboundOrder) {
+  
+
+  if (!isOutbound && inboundView !== 'detail' && lotMode) {
     return (
-      <Layout title={`Recepción - ${selectedInboundOrder.PONumber}`}>
+      <Layout title="Historial y escaneo">
         <div className="space-y-6">
           {error && (
             <div className="rounded-2xl border border-red-200 bg-red-50 dark:border-red-900/60 dark:bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-600 dark:text-red-300">
               {error}
             </div>
           )}
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="rounded-[2rem] border border-slate-100 dark:border-slate-700 bg-white dark:bg-slate-800/95 p-5">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Escaneo por pieza</p>
-              <p className="mt-3 text-sm text-slate-600 dark:text-slate-300">Escanea cada unidad individualmente. Cuando termines, confirma la recepción y especifica cuántas piezas van a cuarentena.</p>
-            </div>
-            <div className="rounded-[2rem] border border-slate-100 dark:border-slate-700 bg-white dark:bg-slate-800/95 p-5">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Progreso de recepción</p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <span className="rounded-full bg-slate-100 dark:bg-slate-700 px-3 py-2 text-[11px] font-semibold text-slate-700 dark:text-slate-200">Escaneado: {totalScannedPieces}</span>
-                <span className="rounded-full bg-slate-100 dark:bg-slate-700 px-3 py-2 text-[11px] font-semibold text-slate-700 dark:text-slate-200">Faltan: {totalRemainingToScanPieces}</span>
-              </div>
-            </div>
-          </div>
-          <div className="bg-slate-900 rounded-[2.5rem] p-6 text-white shadow-xl">
-            <div className="flex justify-between items-start mb-4">
-              <div>
-                <p className="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-1">Proveedor</p>
-                <h2 className="text-xl font-black">{selectedInboundOrder.ProviderName || `Proveedor ${selectedInboundOrder.ProviderID}`}</h2>
-              </div>
-              <div className="bg-white/10 px-3 py-1 rounded-full text-[10px] font-bold">
-                {inboundSummary?.completedCount ?? 0} / {selectedInboundDetails.length || 0} Líneas
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-4">
-              <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
-                <Calendar size={14} />
-                <span>{selectedInboundOrder.OrderDate ? new Date(selectedInboundOrder.OrderDate).toLocaleDateString('es-MX', { day: '2-digit', month: 'short', year: 'numeric' }) : 'Sin fecha'}</span>
-              </div>
-              <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
-                <User size={14} />
-                <span>Orden: {selectedInboundOrder.PONumber}</span>
-              </div>
+
+          <div className="rounded-[2.5rem] border border-slate-100 bg-white p-6 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+            <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Recepción por lote</p>
+            <h2 className="mt-3 text-2xl font-black text-slate-900 dark:text-slate-100">Escanea o captura el lote para recibir</h2>
+            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">El lote se abrirá directamente en la pantalla de recepción.</p>
+            <div className="mt-5 space-y-3">
+              <input
+                value={lotInput}
+                onChange={(e) => setLotInput(e.target.value)}
+                placeholder="Escanea o escribe el lote"
+                className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 outline-none dark:border-slate-700 dark:bg-slate-700/80 dark:text-slate-100"
+              />
+              <button
+                type="button"
+                onClick={handleLotLookup}
+                disabled={lotLookupLoading || !lotInput.trim()}
+                className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-[11px] font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {lotLookupLoading ? 'Abriendo recepción...' : 'Recibir lote'}
+              </button>
             </div>
           </div>
 
-          <div className="bg-white dark:bg-slate-800/95 rounded-[2rem] p-5 shadow-sm border border-slate-100 dark:border-slate-700">
-            <div className="flex items-center justify-between mb-3">
+          <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Avance</p>
-                <p className="text-sm font-black text-slate-900 dark:text-slate-100">{inboundSummary?.totalReceived ?? 0} / {inboundSummary?.totalExpected ?? 0} unidades recibidas</p>
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Lotes disponibles</p>
+                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Toca uno para abrir su orden de recepción</p>
               </div>
-              <span className="text-sm font-black text-emerald-600 dark:text-emerald-400">{inboundSummary?.progress ?? 0}%</span>
+              <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                {filteredAvailableLots.length}
+              </span>
             </div>
-            <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-700 overflow-hidden">
-              <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${inboundSummary?.progress ?? 0}%` }} />
-            </div>
-          </div>
 
-          {detailLoading ? (
-            <div className="flex items-center justify-center py-8 text-slate-500 dark:text-slate-300">
-              <LoaderCircle className="mr-2 animate-spin" size={18} />
-              Cargando detalle...
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {selectedInboundDetails.map((item, index) => {
-                const expected = Number(item.Qty || 0);
-                const received = Number(item.ReceivedQty || 0);
-                const status = received >= expected ? 'completed' : received > 0 ? 'partial' : 'pending';
-                const isActive = activeReceiveLineId === item.PurchaseOrderDetailID;
+            <div className="mt-4 space-y-3">
+              {availableLotsLoading ? (
+                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
+                  Cargando lotes...
+                </div>
+              ) : filteredAvailableLots.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
+                  No hay lotes disponibles para mostrar.
+                </div>
+              ) : filteredAvailableLots.map((lot: any) => {
+                const lotName = lot.InternalLot || lot.ShortInternalLot || lot.ProviderLot || `Lote ${lot.ReceiveID || lot.LotReceiveID}`;
                 return (
-                  <motion.div
-                    key={item.PurchaseOrderDetailID}
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: index * 0.05 }}
-                    className={`bg-white dark:bg-slate-800/95 p-5 rounded-[2rem] border-2 transition-all ${status === 'completed' ? 'border-emerald-100 dark:border-emerald-500/30 bg-emerald-50/30 dark:bg-emerald-500/10' : status === 'partial' ? 'border-amber-100 dark:border-amber-500/30 bg-amber-50/20 dark:bg-amber-500/10' : 'border-slate-100 dark:border-slate-700'}`}
+                  <button
+                    key={`${lot.ReceiveID || lot.LotReceiveID || lot.ProviderLot || lot.InternalLot}-${lot.PurchaseOrderID || lot.PONumber || 'lot'}`}
+                    type="button"
+                    onClick={() => void handleSelectLot(lot)}
+                    className="w-full rounded-2xl border border-slate-100 bg-slate-50/70 p-3 text-left transition-all hover:border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-700/40 dark:hover:border-slate-500"
                   >
-                    <div
-                      className="cursor-pointer"
-                      onClick={() => setActiveReceiveLineId((prev) => prev === item.PurchaseOrderDetailID ? null : item.PurchaseOrderDetailID)}
-                    >
-                      <div className="flex justify-between items-start mb-3">
-                        <div>
-                          <span className="text-[9px] font-black text-slate-400 dark:text-slate-300 uppercase tracking-tighter">{item.PartNumber || item.ItemID}</span>
-                          <h3 className="text-sm font-black text-slate-900 dark:text-slate-100">{item.PartName || 'Sin descripción'}</h3>
-                        </div>
-                        {status === 'completed' ? (
-                          <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center text-white">
-                            <Check size={18} />
-                          </div>
-                        ) : (
-                          <div className="w-10 h-10 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
-                            <Scan size={20} />
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex items-center justify-between text-[11px] font-bold text-slate-500 dark:text-slate-300">
-                        <span>Esperado: {expected}</span>
-                        <span>Recibido: {received}</span>
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">{lot.PONumber || 'Sin PO'}</p>
+                        <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{lotName}</p>
                       </div>
                     </div>
-
-                    {isActive && (
-                      <div className="mt-4 rounded-2xl border border-blue-100 dark:border-blue-900/50 bg-blue-50/60 dark:bg-blue-500/10 p-3">
-                        <div className="flex items-center justify-between mb-2">
-                          <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 dark:text-slate-300">Escaneo por pieza</p>
-                          <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">Faltan {Math.max(0, expected - received - (scannedCounts[item.PurchaseOrderDetailID] || 0))}</span>
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleScanPiece(item)}
-                            disabled={expected <= received + (scannedCounts[item.PurchaseOrderDetailID] || 0)}
-                            className="rounded-xl bg-slate-900 px-4 py-3 text-[11px] font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-60"
-                          >
-                            {expected > received + (scannedCounts[item.PurchaseOrderDetailID] || 0) ? 'Escanear pieza' : 'Completo'}
-                          </button>
-                        </div>
-                        <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-300">Piezas escaneadas: {scannedCounts[item.PurchaseOrderDetailID] || 0}</p>
-                      </div>
-                    )}
-                  </motion.div>
+                    <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                      <span>Cantidad: {lot.Quantity ?? 0}</span>
+                      <span>Proveedor: {lot.ProviderLot || 'Sin referencia'}</span>
+                    </div>
+                  </button>
                 );
               })}
             </div>
-          )}
-
-          {selectedInboundReceipts.length > 0 && (
-            <div className="bg-white dark:bg-slate-800/95 rounded-[2rem] p-5 shadow-sm border border-slate-100 dark:border-slate-700">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300 mb-3">Recepciones registradas</p>
-              <div className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
-                {selectedInboundReceipts.slice(0, 5).map((receipt, index) => (
-                  <div key={`${receipt.ReceiptID || index}`} className="flex justify-between border-b border-slate-100 dark:border-slate-700 pb-2 last:border-b-0 last:pb-0">
-                    <span>{receipt.ReceiptNumber || `Recepción ${index + 1}`}</span>
-                    <span className="font-semibold">{receipt.Quantity || receipt.ReceivedQty || 0}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="space-y-3">
-            <div className="rounded-2xl border border-slate-100 dark:border-slate-700 bg-white dark:bg-slate-800/95 p-5">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Revisión final</p>
-              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">Cuando todas las piezas estén escaneadas, finaliza la recepción y elige cuántas van a cuarentena. El resto ingresará a almacén.</p>
-              <div className="mt-3 flex flex-wrap gap-2 text-sm text-slate-700 dark:text-slate-200">
-                <span className="rounded-full bg-slate-100 dark:bg-slate-700 px-3 py-2">Total escaneado: {totalScannedPieces}</span>
-                <span className="rounded-full bg-slate-100 dark:bg-slate-700 px-3 py-2">Faltan: {totalRemainingToScanPieces}</span>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={handleOpenQuarantineModal}
-              disabled={totalRemainingToScanPieces > 0 || totalScannedPieces === 0 || confirming}
-              className="w-full rounded-2xl bg-blue-600 py-4 text-sm font-black uppercase tracking-widest text-white shadow-xl shadow-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {confirming ? 'Procesando...' : 'Finalizar recepción'}
-            </button>
-            {totalRemainingToScanPieces > 0 && (
-              <p className="text-sm text-slate-500 dark:text-slate-300">Aún faltan {totalRemainingToScanPieces} pieza{totalRemainingToScanPieces === 1 ? '' : 's'} por escanear.</p>
-            )}
           </div>
 
-          {showQuarantineModal && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 py-6">
-              <div className="w-full max-w-xl rounded-[2rem] bg-white dark:bg-slate-800 p-6 shadow-2xl">
-                <h3 className="text-xl font-black text-slate-900 dark:text-slate-100 mb-3">Cuarentena</h3>
-                <p className="text-sm text-slate-600 dark:text-slate-300 mb-4">Indica cuántas piezas van a cuarentena. El resto se registrará como entrada a almacén.</p>
-                <div className="grid gap-4">
-                  <div className="rounded-2xl border border-slate-100 dark:border-slate-700 bg-slate-50 dark:bg-slate-700/70 p-4">
-                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Total escaneado</p>
-                    <p className="text-3xl font-black text-slate-900 dark:text-slate-100">{totalScannedPieces}</p>
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Piezas para cuarentena</label>
-                    <input
-                      type="number"
-                      min="0"
-                      max={totalScannedPieces}
-                      value={quarantineQty}
-                      onChange={(e) => {
-                        const value = Number(e.target.value);
-                        setQuarantineQty(Number.isFinite(value) ? Math.max(0, Math.min(value, totalScannedPieces)) : 0);
-                      }}
-                      className="w-full rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-700/80 px-4 py-3 text-sm font-semibold text-slate-700 dark:text-slate-100 outline-none"
-                    />
-                    <p className="text-[11px] text-slate-500 dark:text-slate-300">{totalScannedPieces - quarantineQty} piezas irán directo a almacén.</p>
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Estatus de orden (MES)</label>
-                    <select
-                      value={selectedStatusId}
-                      onChange={(e) => setSelectedStatusId(e.target.value)}
-                      className="w-full rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-700/80 px-4 py-3 text-sm font-semibold text-slate-700 dark:text-slate-100 outline-none"
-                    >
-                      <option value="">Seleccionar estatus</option>
-                      {statusOptions.map((s) => (
-                        <option key={s.StatusID} value={String(s.StatusID)}>{s.StatusDescription || s.StatusCode}</option>
-                      ))}
-                    </select>
-                    <p className="text-[11px] text-slate-500 dark:text-slate-300">La etiqueta se mostrará localmente; en la BD se guardará el ID seleccionado.</p>
-                  </div>
-                </div>
-                <div className="mt-6 flex flex-col gap-3 sm:flex-row">
-                  <button
-                    type="button"
-                    onClick={() => setShowQuarantineModal(false)}
-                    className="flex-1 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-700 py-4 text-sm font-black uppercase tracking-widest text-slate-700 dark:text-slate-100"
-                  >
-                    Cancelar
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleConfirmOrder}
-                    disabled={confirming}
-                    className="flex-1 rounded-2xl bg-blue-600 py-4 text-sm font-black uppercase tracking-widest text-white disabled:opacity-60"
-                  >
-                    {confirming ? 'Confirmando...' : 'Confirmar recepción'}
-                  </button>
-                </div>
+          <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Órdenes pendientes por recibir</p>
+                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Toca una para abrir sus detalles</p>
               </div>
+              <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                {orders.filter((order) => getInboundOrderStatus(order) === 'pending').length}
+              </span>
             </div>
-          )}
+
+            <div className="mt-4 space-y-3">
+              {loadingOrders ? (
+                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
+                  Cargando órdenes...
+                </div>
+              ) : orders.filter((order) => getInboundOrderStatus(order) === 'pending').length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
+                  No hay órdenes pendientes para mostrar.
+                </div>
+              ) : orders.filter((order) => getInboundOrderStatus(order) === 'pending').map((order) => (
+                <button
+                  key={order.PurchaseOrderID}
+                  type="button"
+                  onClick={() => void handleSelectInboundOrder(order as InboundOrderSummary)}
+                  className="w-full rounded-2xl border border-slate-100 bg-slate-50/70 p-3 text-left transition-all hover:border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-700/40 dark:hover:border-slate-500"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">{order.PONumber || order.PurchaseOrderID}</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{order.ProviderName || `Proveedor ${order.ProviderID}`}</p>
+                    </div>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                      Pendiente
+                    </span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                    <span>Recibido: {order.receivedQty ?? 0}</span>
+                    <span>Esperado: {order.orderedQty ?? 0}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </Layout>
+    );
+  }
+
+  if (isInboundDetailView) {
+    return (
+      <div className="fixed inset-0 z-[100] bg-slate-950/75 p-3 sm:p-6">
+        <div className="mx-auto flex h-full max-w-5xl flex-col overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+          <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-700 dark:bg-slate-800/70">
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Detalle de recepción</p>
+              <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">{selectedInboundOrder?.PONumber || 'Recepción'}</p>
+            </div>
+            <button
+              type="button"
+              onClick={closeInboundDetailView}
+              className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-black uppercase tracking-widest text-slate-700 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-100"
+            >
+              Cerrar
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
+            {error && (
+              <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-600 dark:border-red-900/60 dark:bg-red-500/10 dark:text-red-300">
+                {error}
+              </div>
+            )}
+
+            <div className="rounded-[2rem] border border-slate-100 bg-slate-50 p-5 shadow-sm dark:border-slate-700 dark:bg-slate-700/40">
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Proveedor y Orden</p>
+              <p className="mt-2 text-lg font-black text-slate-900 dark:text-slate-100">{selectedInboundOrder?.ProviderName || 'Proveedor'}</p>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">PO: {selectedInboundOrder?.PONumber || 'Sin PO'}</p>
+            </div>
+
+            {inboundSummary && (
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Esperado</p>
+                  <p className="mt-2 text-2xl font-black text-slate-900 dark:text-slate-100">{inboundSummary.totalExpected}</p>
+                </div>
+                <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Escaneado</p>
+                  <p className="mt-2 text-2xl font-black text-blue-600 dark:text-blue-400">{totalScannedPieces}</p>
+                </div>
+                <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Restante</p>
+                  <p className="mt-2 text-2xl font-black text-slate-900 dark:text-slate-100">{totalRemainingToScanPieces}</p>
+                </div>
+              </div>
+            )}
+
+            <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Artículos a recibir</p>
+              {selectedInboundDetails.length === 0 ? (
+                <p className="mt-2 text-sm text-slate-500 dark:text-slate-300">Aún no hay líneas para esta orden.</p>
+              ) : (
+                <div className="mt-4 space-y-3">
+                  {selectedInboundDetails.map((item) => {
+                    const scanned = scannedCounts[item.PurchaseOrderDetailID] || 0;
+                    const expected = Number(item.Qty || 0);
+                    const received = Number(item.ReceivedQty || 0);
+                    const remaining = Math.max(0, expected - received - scanned);
+                    const isComplete = remaining === 0 && scanned > 0;
+
+                    return (
+                      <div
+                        key={item.PurchaseOrderDetailID}
+                        className={`rounded-2xl border p-4 transition-all ${
+                          isComplete
+                            ? 'border-emerald-200 bg-emerald-50 dark:border-emerald-900/40 dark:bg-emerald-900/20'
+                            : 'border-slate-100 bg-slate-50/70 dark:border-slate-700 dark:bg-slate-700/40'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">
+                              {item.PartNumber || item.ItemID}
+                            </p>
+                            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{item.PartName || 'Sin descripción'}</p>
+                            <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
+                              Área: {item.WorkArea || 'Sin área'} | Medida: {item.MeasureDescription || 'Unidad'}
+                            </p>
+                          </div>
+                          <div className="text-right">
+                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Escaneado</p>
+                            <p className="mt-1 text-2xl font-black text-blue-600 dark:text-blue-400">{scanned}</p>
+                            <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">Restante: {remaining}</p>
+                          </div>
+                        </div>
+
+                        {remaining > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => handleScanPiece(item)}
+                            className="mt-3 w-full rounded-xl border-2 border-blue-500 bg-blue-50 py-2 text-sm font-black uppercase tracking-widest text-blue-600 transition-all active:scale-95 dark:bg-blue-900/20 dark:text-blue-400"
+                          >
+                            <Scan size={16} className="mb-1 inline mr-2" />
+                            Escanear (+1)
+                          </button>
+                        )}
+
+                        {isComplete && (
+                          <div className="mt-3 flex items-center gap-2 rounded-xl border-2 border-emerald-500 bg-emerald-50 py-2 px-3 dark:border-emerald-900/50 dark:bg-emerald-900/20">
+                            <Check size={16} className="text-emerald-600 dark:text-emerald-400" />
+                            <span className="text-sm font-black text-emerald-600 dark:text-emerald-400">Completo</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {totalScannedPieces > 0 && (
+              <button
+                type="button"
+                onClick={handleOpenQuarantineModal}
+                disabled={confirming}
+                className="w-full rounded-2xl bg-slate-900 px-4 py-4 text-sm font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-60 dark:bg-slate-800"
+              >
+                {confirming ? 'Procesando...' : `Confirmar recepción (${totalScannedPieces} piezas)`}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     );
   }
 

@@ -49,12 +49,37 @@ export const Transfers: React.FC = () => {
 
   useEffect(() => {
     const requestId = Number(new URLSearchParams(location.search).get('requestId'));
-    if (!requestId || loading || requests.length === 0 || showStorageModal) return;
+    if (!requestId || loading || showStorageModal) return;
 
     const matchedRequest = requests.find((item) => Number(item.RequestID) === requestId);
     if (matchedRequest) {
       void execute(matchedRequest);
+      return;
     }
+
+    // If not found in current list, try fetching single request by id (supports consumption requests redirected from Salidas)
+    (async () => {
+      try {
+        const res = await fetch(`/api/requests/${requestId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const req = data.request;
+        if (req) {
+          // Normalize shape to Req type
+          const normalized: Req = {
+            RequestID: Number(req.RequestID),
+            RequestName: req.RequestName || '',
+            PartNumber: req.PartNumber || '',
+            Quantity: Number(req.Quantity || 0),
+            SourceLocationID: req.SourceLocationID || undefined,
+            DestinationLocationID: req.DestinationLocationID || undefined,
+          };
+          void execute(normalized);
+        }
+      } catch (e) {
+        console.error('Error fetching request by id', e);
+      }
+    })();
   }, [location.search, loading, requests, showStorageModal]);
 
   async function loadLocationNames() {

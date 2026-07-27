@@ -2,7 +2,7 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { 
   Home, 
-  Scan, 
+  Glasses, 
   Package, 
   BarChart2, 
   Bell, 
@@ -39,9 +39,8 @@ export const Layout: React.FC<LayoutProps> = ({ children, title, showNav = true 
 
   const navItems = [
     { icon: Home, label: getTranslation(language, 'nav.home'), path: '/' },
-    { icon: Scan, label: getTranslation(language, 'nav.scanner'), path: '/scanner' },
+    { icon: Glasses, label: getTranslation(language, 'nav.scanner'), path: '/scanner' },
     { icon: Package, label: getTranslation(language, 'nav.inventory'), path: '/inventory' },
-    { icon: BarChart2, label: getTranslation(language, 'nav.reports'), path: '/reports' },
     { icon: Bell, label: getTranslation(language, 'nav.notifications'), path: '/notifications' },
     { icon: Settings, label: getTranslation(language, 'nav.settings'), path: '/settings' },
   ];
@@ -119,7 +118,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, title, showNav = true 
       {/* Bottom Navigation (Mobile PDA style) */}
       {showNav && (
         <nav className="bg-white border-t border-slate-200 flex justify-around items-center py-2 px-1 fixed bottom-0 left-0 right-0 shadow-[0_-1px_1px_rgba(15,23,42,0.05)] z-10 dark:bg-slate-950 dark:border-slate-800 dark:shadow-[0_-1px_1px_rgba(0,0,0,0.35)]">
-          {navItems.slice(0, 4).map((item) => {
+          {navItems.filter((item) => item.path !== '/reports').slice(0, 4).map((item) => {
             const isActive = location.pathname === item.path;
             return (
               <button

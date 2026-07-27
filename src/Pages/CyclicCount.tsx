@@ -2,6 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { RefreshCw, Check, Package, AlertCircle, Scan, LoaderCircle, Plus, X } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
+import { notifyAppRefresh, useAppRefresh } from '../utils/realtime';
 
 interface CycleCount {
   CycleCountID: number;
@@ -33,6 +34,10 @@ interface CycleItem {
   RackColumn: number;
   RackCell: number;
   LocationName: string;
+  LotInventoryID?: number;
+  LotReceiveID?: number;
+  CurrentInternalLot?: string;
+  LotCurrentQuantity?: number;
 }
 
 interface StorageLocation {
@@ -41,6 +46,15 @@ interface StorageLocation {
   RackColumn: number;
   RackCell: number;
   LocationID: number;
+  LocationName?: string;
+  OccupiedItemCount?: number;
+  OccupiedQuantity?: number;
+  Status?: string;
+}
+
+interface RackGroup<T> {
+  rackName: string;
+  items: T[];
 }
 
 export const CyclicCount: React.FC = () => {
@@ -50,7 +64,7 @@ export const CyclicCount: React.FC = () => {
   const [cycleItems, setCycleItems] = useState<CycleItem[]>([]);
   const [loadingItems, setLoadingItems] = useState(false);
   const [counting, setCounting] = useState(false);
-  const [scannedItems, setScannedItems] = useState<{ inventoryId: number; sku: string; name: string; quantity: number }[]>([]);
+  const [scannedItems, setScannedItems] = useState<{ inventoryId: number; sku: string; name: string; quantity: number; lotInventoryId?: number; lotReceiveId?: number }[]>([]);
   const [countValues, setCountValues] = useState<Record<number, number>>({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -91,6 +105,32 @@ export const CyclicCount: React.FC = () => {
     void loadCycles(false);
   }, 10000);
 
+  const rackLocationGroups = React.useMemo(() => {
+    const grouped = new Map<string, StorageLocation[]>();
+    for (const location of locations) {
+      const rackName = location.RackName || 'Sin rack';
+      if (!grouped.has(rackName)) grouped.set(rackName, []);
+      grouped.get(rackName)!.push(location);
+    }
+    return [...grouped.entries()].map(([rackName, items]) => ({
+      rackName,
+      items: items.sort((a, b) => a.RackColumn - b.RackColumn || a.RackCell - b.RackCell),
+    }));
+  }, [locations]);
+
+  const cycleRackGroups = React.useMemo(() => {
+    const grouped = new Map<string, CycleCount[]>();
+    for (const cycle of cycles) {
+      const rackName = cycle.RackName || 'Sin rack';
+      if (!grouped.has(rackName)) grouped.set(rackName, []);
+      grouped.get(rackName)!.push(cycle);
+    }
+    return [...grouped.entries()].map(([rackName, items]) => ({
+      rackName,
+      items: items.sort((a, b) => a.CycleCountID - b.CycleCountID),
+    }));
+  }, [cycles]);
+
   const handleOpenCreateModal = async () => {
     setShowCreateModal(true);
     setLocationInput('');
@@ -119,14 +159,14 @@ export const CyclicCount: React.FC = () => {
       if (!res.ok) throw new Error('Error creando ciclo');
       const data = await res.json();
       
-      // Agregar el nuevo ciclo al inicio de la lista
+      // Agregar el nuevo ciclo al inicio de la lista y cargar sus items
       if (data.cycle) {
         setCycles(prev => [data.cycle, ...prev]);
+        await handleSelectCycle(data.cycle.CycleCountID);
       }
       notifyAppRefresh('action');
       setShowCreateModal(false);
       setLocationInput('');
-      setSelectedCycleId(data.cycle.CycleCountID);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error creando ciclo');
     } finally {
@@ -175,6 +215,35 @@ export const CyclicCount: React.FC = () => {
     }));
   };
 
+  const getItemCountStatus = (item: CycleItem) => {
+    const countedQty = Number(countValues[item.InventoryID] ?? item.CurrentQuantity ?? 0);
+    const currentQty = Number(item.CurrentQuantity ?? 0);
+
+    if (countValues[item.InventoryID] === undefined) {
+      return 'pending';
+    }
+    if (countedQty === currentQty) {
+      return 'ok';
+    }
+    if (countedQty > currentQty) {
+      return 'high';
+    }
+    return 'low';
+  };
+
+  const getStatusClasses = (status: string) => {
+    switch (status) {
+      case 'ok':
+        return 'bg-emerald-100 text-emerald-700 border-emerald-200';
+      case 'high':
+        return 'bg-amber-100 text-amber-800 border-amber-200';
+      case 'low':
+        return 'bg-rose-100 text-rose-700 border-rose-200';
+      default:
+        return 'bg-slate-100 text-slate-500 border-slate-200';
+    }
+  };
+
   const handleRegisterItem = (item: CycleItem) => {
     const quantity = Number(countValues[item.InventoryID] ?? item.CurrentQuantity ?? 1);
     const safeQuantity = Number.isFinite(quantity) && quantity >= 0 ? quantity : 0;
@@ -191,6 +260,8 @@ export const CyclicCount: React.FC = () => {
         sku: item.PartNumber,
         name: item.PartName,
         quantity: safeQuantity,
+        lotInventoryId: item.LotInventoryID,
+        lotReceiveId: item.LotReceiveID,
       };
 
       if (existingIndex >= 0) {
@@ -210,6 +281,7 @@ export const CyclicCount: React.FC = () => {
       const payload = scannedItems.map(item => ({
         inventoryId: item.inventoryId,
         countedQty: item.quantity,
+        lotInventoryId: item.lotInventoryId,
       }));
       const res = await fetch(`/api/cyclic-count/${selectedCycleId}/complete`, {
         method: 'POST',
@@ -285,6 +357,9 @@ export const CyclicCount: React.FC = () => {
                         <p className="text-[9px] font-black text-slate-400 dark:text-slate-300 uppercase">{item.PartNumber}</p>
                         <h4 className="text-sm font-black text-slate-900 dark:text-slate-100">{item.PartName}</h4>
                         <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Stock actual: {Number(item.CurrentQuantity || 0).toFixed(2)}</p>
+                        {item.LotInventoryID ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Lote: {item.CurrentInternalLot || item.LotReceiveID || item.LotInventoryID}</p>
+                        ) : null}
                       </div>
                       <div className="flex flex-col items-end gap-2">
                         <label className="text-[10px] font-black text-slate-400 uppercase">Cantidad</label>
@@ -299,12 +374,23 @@ export const CyclicCount: React.FC = () => {
                       </div>
                     </div>
 
-                    <button
-                      onClick={() => handleRegisterItem(item)}
-                      className="mt-3 w-full bg-blue-600 text-white py-3 rounded-2xl font-black uppercase tracking-widest active:scale-95 transition-all"
-                    >
-                      Registrar
-                    </button>
+                    <div className="mt-3 flex flex-col gap-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-bold ${getStatusClasses(getItemCountStatus(item))}`}>
+                          {getItemCountStatus(item) === 'ok' && 'Igual'}
+                          {getItemCountStatus(item) === 'high' && 'Alta'}
+                          {getItemCountStatus(item) === 'low' && 'Baja'}
+                          {getItemCountStatus(item) === 'pending' && 'Pendiente'}
+                        </span>
+                        <span className="text-[10px] uppercase font-black tracking-widest text-slate-400">Actual: {Number(item.CurrentQuantity || 0).toFixed(0)}</span>
+                      </div>
+                      <button
+                        onClick={() => handleRegisterItem(item)}
+                        className="w-full bg-blue-600 text-white py-3 rounded-2xl font-black uppercase tracking-widest active:scale-95 transition-all"
+                      >
+                        Registrar
+                      </button>
+                    </div>
                   </motion.div>
                 ))}
               </div>
@@ -316,7 +402,7 @@ export const CyclicCount: React.FC = () => {
                 <div className="flex flex-wrap gap-2">
                   {scannedItems.slice(-8).map((item, i) => (
                     <span key={i} className="bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full text-xs font-bold">
-                      {item.sku} × {item.quantity}
+                      {item.sku}{item.lotInventoryId ? ` / Lote ${item.lotInventoryId}` : ''} × {item.quantity}
                     </span>
                   ))}
                 </div>
@@ -424,21 +510,29 @@ export const CyclicCount: React.FC = () => {
             <LoaderCircle className="mr-2 animate-spin" size={18} />
             Cargando ciclos...
           </div>
-        ) : cycles.length === 0 ? (
-          <div className="text-center py-10 text-slate-500">
-            <AlertCircle size={32} className="mx-auto mb-2 opacity-50" />
-            No hay ciclos disponibles
-          </div>
         ) : (
-          cycles.map((cycle, index) => (
-            <motion.button
-              key={cycle.CycleCountID}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: index * 0.05 }}
-              onClick={() => handleSelectCycle(cycle.CycleCountID)}
-              className="w-full bg-white dark:bg-slate-800/95 p-5 rounded-[2.5rem] border border-slate-100 dark:border-slate-700 shadow-sm flex items-start gap-4 active:scale-[0.98] transition-all"
-            >
+          <div className="space-y-5">
+            {cycleRackGroups.map((group, groupIndex) => (
+              <div key={group.rackName} className="space-y-4">
+                <div className="flex items-center justify-between px-3 py-2 rounded-3xl bg-slate-100 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-700">
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-widest text-slate-500 dark:text-slate-400">Rack</p>
+                    <h3 className="text-base font-black text-slate-900 dark:text-slate-100">{group.rackName}</h3>
+                  </div>
+                  <span className="text-[10px] font-black uppercase px-3 py-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300">
+                    {group.items.length} conteos
+                  </span>
+                </div>
+
+                {group.items.map((cycle, index) => (
+                  <motion.button
+                    key={cycle.CycleCountID}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: (groupIndex * 0.05) + (index * 0.02) }}
+                    onClick={() => handleSelectCycle(cycle.CycleCountID)}
+                    className="w-full bg-white dark:bg-slate-800/95 p-5 rounded-[2.5rem] border border-slate-100 dark:border-slate-700 shadow-sm flex items-start gap-4 active:scale-[0.98] transition-all"
+                  >
               <div className={`w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0 ${
                 cycle.StatusCode === 'COMPLETED' ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' :
                 cycle.StatusCode === 'IN_PROCESS' ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400' :
@@ -463,8 +557,11 @@ export const CyclicCount: React.FC = () => {
                   <span className="flex-shrink-0">Items: {cycle.InventoryItemCount || 0}</span>
                 </div>
               </div>
-            </motion.button>
-          ))
+                  </motion.button>
+                ))}
+              </div>
+            ))}
+          </div>
         )}
       </div>
 
@@ -510,27 +607,48 @@ export const CyclicCount: React.FC = () => {
                   Cargando ubicaciones...
                 </div>
               ) : (
-                <div className="max-h-96 overflow-y-auto space-y-2">
-                  {locations.length > 0 ? (
-                    locations.map(location => (
-                      <button
-                        key={location.StorageID}
-                        onClick={() => handleCreateCycle(location.StorageID)}
-                        disabled={creatingCycle}
-                        className="w-full bg-slate-50 dark:bg-slate-700/70 p-4 rounded-2xl text-left border-2 border-slate-100 dark:border-slate-700 hover:border-blue-300 hover:bg-blue-50 dark:hover:bg-slate-600 active:scale-95 transition-all disabled:opacity-60"
-                      >
-                        <div className="flex justify-between items-start">
-                          <div>
-                            <p className="text-xs font-black text-slate-400 dark:text-slate-300 uppercase">Rack ID: {location.StorageID}</p>
-                            <h3 className="text-base font-black text-slate-900 dark:text-slate-100">
-                              {location.RackName} - Col {location.RackColumn} Cell {location.RackCell}
-                            </h3>
+                <div className="max-h-96 overflow-y-auto space-y-4">
+                  {rackLocationGroups.length > 0 ? (
+                    rackLocationGroups.map((group) => (
+                      <div key={group.rackName} className="space-y-3">
+                        <div className="px-4 py-3 rounded-3xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-700">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500">Rack</p>
+                              <h3 className="text-base font-black text-slate-900 dark:text-slate-100">{group.rackName}</h3>
+                            </div>
+                            <span className="text-[10px] font-black uppercase px-3 py-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300">
+                              {group.items.length} ubicaciones
+                            </span>
                           </div>
-                          {creatingCycle && (
-                            <LoaderCircle className="animate-spin text-blue-600" size={20} />
-                          )}
                         </div>
-                      </button>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          {group.items.map((location) => (
+                            <button
+                              key={location.StorageID}
+                              onClick={() => handleCreateCycle(location.StorageID)}
+                              disabled={creatingCycle}
+                              className="w-full text-left rounded-3xl border-2 px-4 py-4 border-slate-100 dark:border-slate-700 bg-white dark:bg-slate-800/95 hover:border-blue-300 hover:bg-blue-50 dark:hover:bg-slate-700 active:scale-95 transition-all disabled:opacity-60"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div>
+                                  <p className="text-[10px] font-black uppercase text-slate-400 dark:text-slate-500">Ubicación</p>
+                                  <h4 className="text-sm font-black text-slate-900 dark:text-slate-100">{location.RackName} - Col {location.RackColumn} Celda {location.RackCell}</h4>
+                                </div>
+                                <span className={`text-[10px] font-black uppercase px-3 py-1 rounded-full ${location.Status === 'occupied' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                                  {location.Status === 'occupied' ? 'Ocupada' : 'Libre'}
+                                </span>
+                              </div>
+                              {location.LocationName ? (
+                                <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">{location.LocationName}</p>
+                              ) : null}
+                              <div className="mt-3 text-[11px] text-slate-500 dark:text-slate-400">
+                                {location.OccupiedItemCount ?? 0} items · {location.OccupiedQuantity ?? 0} unidades
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     ))
                   ) : (
                     <div className="text-center py-6 text-slate-500">

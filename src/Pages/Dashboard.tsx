@@ -75,10 +75,10 @@ export const Dashboard: React.FC = () => {
       if (showLoading) {
         setActivitiesLoading(true);
       }
-      const response = await fetch('/api/history/inbound?limit=3');
+      const response = await fetch('/api/activity-history?limit=3');
       if (!response.ok) throw new Error('No fue posible cargar la actividad reciente');
       const data = await response.json();
-      setRecentActivities(Array.isArray(data.history) ? data.history : []);
+      setRecentActivities(Array.isArray(data.activities) ? data.activities : []);
     } catch (err) {
       if (showLoading) {
         setRecentActivities([]);

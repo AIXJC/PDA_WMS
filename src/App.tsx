@@ -14,6 +14,7 @@ import { Notifications } from './Pages/Notifications';
 import { Reports } from './Pages/Reports';
 import { Requests } from './Pages/Requests';
 import { Transfers } from './Pages/Transfers';
+import { Salidas } from './Pages/Salidas';
 import { Adjustments } from './Pages/Adjustments';
 import { HistoryPage } from './Pages/History';
 import { CyclicCount } from './Pages/CyclicCount';
@@ -71,6 +72,19 @@ function App() {
           </ProtectedRoute>
         } />
         
+        <Route path="/orders/:type/detail/:detailId?" element={
+          <ProtectedRoute>
+            <Orders />
+          </ProtectedRoute>
+        } />
+
+        {/* Specific outbound route for Salidas (consumables) */}
+        <Route path="/orders/outbound" element={
+          <ProtectedRoute>
+            <Salidas />
+          </ProtectedRoute>
+        } />
+
         <Route path="/orders/:type" element={
           <ProtectedRoute>
             <Orders />
@@ -92,6 +106,12 @@ function App() {
         <Route path="/transfers" element={
           <ProtectedRoute>
             <Transfers />
+          </ProtectedRoute>
+        } />
+
+        <Route path="/salidas" element={
+          <ProtectedRoute>
+            <Salidas />
           </ProtectedRoute>
         } />
         

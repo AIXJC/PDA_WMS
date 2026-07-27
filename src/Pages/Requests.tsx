@@ -113,7 +113,14 @@ export const Requests: React.FC = () => {
     try {
       const r = await fetch('/api/request-types');
       const d = await r.json();
-      setRequestTypes(Array.isArray(d.requestTypes) ? d.requestTypes : []);
+      const allTypes = Array.isArray(d.requestTypes) ? d.requestTypes : [];
+      const isConsumption = (label?: string) => {
+        if (!label) return false;
+        const key = String(label).toLowerCase();
+        return key.includes('consum') || key.includes('consumption') || key.includes('consumo');
+      };
+      // Exclude consumption-type from the general Requests create/select UI
+      setRequestTypes(allTypes.filter((t: any) => !isConsumption(t.RequestType)));
     } catch (e) {
       console.error('Error loading request types', e);
     }
@@ -156,7 +163,14 @@ export const Requests: React.FC = () => {
       await Promise.all([loadLocationNames(), loadRequestTypes(), loadLots(), loadInventoryOptions()]);
       const r = await fetch('/api/requests?limit=100');
       const d = await r.json();
-      setRequests(Array.isArray(d.requests) ? d.requests : []);
+      const all = Array.isArray(d.requests) ? d.requests : [];
+      const isConsumption = (label?: string) => {
+        if (!label) return false;
+        const key = String(label).toLowerCase();
+        return key.includes('consum') || key.includes('consumption') || key.includes('consumo');
+      };
+      // Remove requests that are handled by the Salidas (consumption) module
+      setRequests(all.filter((req: any) => !isConsumption(req.RequestTypeName || req.RequestTypeDescription)));
     } catch (e) {
       console.error(e);
       if (showLoading) {
@@ -300,8 +314,8 @@ export const Requests: React.FC = () => {
                     onChange={(e) => setForm((prev) => ({ ...prev, LotReceiveID: e.target.value }))}
                     className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
                   >
-                    <option value="">Selecciona un lote</option>
-                    {lots.map((lot) => {
+                    <option value="">Selecciona un lote (solo en Storage)</option>
+                    {lots.filter((lot) => lot.inStorage).map((lot) => {
                       const lotLabel = lot.InternalLot || lot.ShortInternalLot || lot.ProviderLot || `Lote ${lot.ReceiveID}`;
                       return (
                         <option key={lot.ReceiveID} value={lot.ReceiveID}>{lotLabel} {lot.PartNumber ? `- ${lot.PartNumber}` : ''}</option>

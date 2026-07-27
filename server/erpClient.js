@@ -1,10 +1,17 @@
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.join(__dirname, ".env"), override: false });
+const envPath = path.join(__dirname, ".env");
+
+if (fs.existsSync(envPath)) {
+  dotenv.config({ path: envPath, override: true });
+} else {
+  dotenv.config();
+}
 
 const REQUEST_TIMEOUT_MS = Number(process.env.ERP_REQUEST_TIMEOUT_MS || 10000);
 
