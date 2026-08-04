@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { FileText, Plus, Check, X, Clock, ChevronRight, User, RefreshCw } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
@@ -28,6 +29,17 @@ type InventoryOption = {
   stock: number | string;
   locationName?: string;
   unitType?: string;
+};
+
+type LotInventoryOption = {
+  LotInventoryID: number;
+  LotReceiveID?: number;
+  CurrentInternalLot?: string;
+  CurrentQuantity?: number | string;
+  CurrentLocationID?: number | null;
+  PartNumber?: string;
+  PartName?: string;
+  UnitType?: string;
 };
 
 type RequestFormState = {
@@ -62,7 +74,11 @@ export const Requests: React.FC = () => {
   const [inventoryOptions, setInventoryOptions] = useState<InventoryOption[]>([]);
   const [selectedInventoryItem, setSelectedInventoryItem] = useState<InventoryOption | null>(null);
   const [lots, setLots] = useState<Array<{ReceiveID:number; ProviderLot?:string; InternalLot?:string; ShortInternalLot?:string; PartNumber?:string}>>([]);
+  const [lotInventoryOptions, setLotInventoryOptions] = useState<LotInventoryOption[]>([]);
+  const [lotSearchText, setLotSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | '40' | '41' | '42'>('all');
+  const lotSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const lotSearchTimeoutRef = useRef<number | null>(null);
   const [form, setForm] = useState<RequestFormState>({
     RequestName: '',
     PartNumber: '',
@@ -73,12 +89,73 @@ export const Requests: React.FC = () => {
     DestinationLocationID: '',
     LotReceiveID: '',
   });
+  const location = useLocation();
   const { t } = useTranslation();
   const user = useAuthStore((s) => s.user);
 
   useEffect(() => {
     void loadRequests();
   }, []);
+
+  useEffect(() => {
+    if (showCreate && (form.RequestTypeID === '2' || form.RequestTypeID === '12')) {
+      const timer = window.setTimeout(() => {
+        lotSearchInputRef.current?.focus();
+        lotSearchInputRef.current?.select();
+      }, 180);
+      return () => window.clearTimeout(timer);
+    }
+  }, [showCreate, form.RequestTypeID]);
+
+  useEffect(() => {
+    return () => {
+      if (lotSearchTimeoutRef.current) {
+        window.clearTimeout(lotSearchTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!form.LotReceiveID) {
+      setLotSearchText('');
+      return;
+    }
+    const selectedLotInventory = lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(form.LotReceiveID));
+    if (selectedLotInventory) {
+      setLotSearchText((prev) => prev || selectedLotInventory.CurrentInternalLot || '');
+    }
+  }, [form.LotReceiveID, lotInventoryOptions]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const incomingBridge = params.get('from') === 'inbound';
+    const outboundBridge = params.get('from') === 'outbound';
+    const lotInventoryId = params.get('lotInventoryId');
+    const lotReference = params.get('lotReference') || '';
+
+    if ((!incomingBridge && !outboundBridge) || !lotInventoryId) return;
+
+    setShowCreate(true);
+    setForm((prev) => ({
+      ...prev,
+      RequestTypeID: outboundBridge ? '12' : '2',
+      LotReceiveID: String(lotInventoryId),
+      PartNumber: prev.PartNumber || '',
+      Quantity: prev.Quantity || '1',
+      SourceLocationID: prev.SourceLocationID || '',
+      DestinationLocationID: prev.DestinationLocationID || '',
+      Comments: prev.Comments || '',
+    }));
+
+    if (lotInventoryOptions.length > 0) {
+      const matchedLot = lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(lotInventoryId));
+      if (matchedLot) {
+        selectLotById(matchedLot.LotInventoryID, lotReference, { autoSelectDestination: true, bridgeType: outboundBridge ? 'outbound' : 'inbound' });
+      }
+    } else {
+      setLotSearchText(lotReference);
+    }
+  }, [location.search, lotInventoryOptions]);
 
   useAppRefresh(() => {
     void loadRequests(false);
@@ -109,18 +186,107 @@ export const Requests: React.FC = () => {
     }
   }
 
+  const isHiddenRequestType = (label?: string) => {
+    if (!label) return false;
+    const key = String(label).toLowerCase();
+    return key.includes('consum') ||
+      key.includes('consumption') ||
+      key.includes('consumo') ||
+      key.includes('scrap') ||
+      key.includes('receipt') ||
+      key.includes('adjustment') ||
+      key.includes('return');
+  };
+
+  const getLotOptionLabel = (lot: LotInventoryOption) => {
+    const lotLabel = lot.CurrentInternalLot || `Lote ${lot.LotInventoryID}`;
+    const locationLabel = lot.CurrentLocationID ? ` • Origen ${locationNames[lot.CurrentLocationID] || `#${lot.CurrentLocationID}`}` : '';
+    return `${lotLabel} • ${lot.PartNumber || 'Sin producto'} • Cantidad ${lot.CurrentQuantity ?? 0} • ${lot.PartName || 'Sin nombre'}${locationLabel}`;
+  };
+
+  const handleLotSearchChange = (value: string) => {
+    const nextValue = value;
+    setLotSearchText(nextValue);
+
+    if (lotSearchTimeoutRef.current) {
+      window.clearTimeout(lotSearchTimeoutRef.current);
+      lotSearchTimeoutRef.current = null;
+    }
+
+    if (!nextValue.trim()) {
+      setForm((prev) => ({ ...prev, LotReceiveID: '', SourceLocationID: prev.SourceLocationID, DestinationLocationID: '' }));
+      setSelectedInventoryItem(null);
+      return;
+    }
+
+    const normalizedValue = nextValue.trim().toLowerCase();
+    const allowedLots = isPartialTransferRequest
+      ? lotInventoryOptions.filter((lot) => isStorageLocationName(locationNames[lot.CurrentLocationID ?? 0]))
+      : lotInventoryOptions;
+    const matchingLots = allowedLots.filter((lot) => {
+      const haystack = `${lot.CurrentInternalLot || ''} ${lot.PartNumber || ''} ${lot.PartName || ''} ${lot.CurrentQuantity ?? ''}`.toLowerCase();
+      return haystack.includes(normalizedValue);
+    });
+
+    if (matchingLots.length === 1 && normalizedValue.length >= 2) {
+      lotSearchTimeoutRef.current = window.setTimeout(() => {
+        selectLotById(matchingLots[0].LotInventoryID, nextValue);
+      }, 120);
+    }
+  };
+
+  const selectLotById = (lotInventoryId: number | string | null, preserveText?: string, options?: { autoSelectDestination?: boolean }) => {
+    if (lotSearchTimeoutRef.current) {
+      window.clearTimeout(lotSearchTimeoutRef.current);
+      lotSearchTimeoutRef.current = null;
+    }
+    const selectedLotInventory = lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(lotInventoryId)) || null;
+    const incomingBridge = new URLSearchParams(location.search).get('from') === 'inbound';
+    const outboundBridge = new URLSearchParams(location.search).get('from') === 'outbound';
+    const defaultDestinationId = incomingBridge
+      ? (destinationLocations.find((location) => /stor|almac/i.test(String(location.LocationName || '')))?.LocationID?.toString() || '')
+      : outboundBridge
+        ? (destinationLocations.find((location) => /(produ|production|producción|produccion)/i.test(String(location.LocationName || '')))?.LocationID?.toString() || '')
+        : '';
+    const defaultSourceId = outboundBridge
+      ? (selectedLotInventory?.CurrentLocationID ? String(selectedLotInventory.CurrentLocationID) : (sourceLocations.find((location) => /stor|almac/i.test(String(location.LocationName || '')))?.LocationID?.toString() || ''))
+      : '';
+
+    setForm((prev) => ({
+      ...prev,
+      LotReceiveID: selectedLotInventory ? String(selectedLotInventory.LotInventoryID) : '',
+      PartNumber: selectedLotInventory?.PartNumber || prev.PartNumber,
+      Quantity: selectedLotInventory?.CurrentQuantity ? String(selectedLotInventory.CurrentQuantity) : prev.Quantity,
+      SourceLocationID: outboundBridge ? (defaultSourceId || prev.SourceLocationID) : (selectedLotInventory?.CurrentLocationID ? String(selectedLotInventory.CurrentLocationID) : prev.SourceLocationID),
+      DestinationLocationID: options?.autoSelectDestination === false ? prev.DestinationLocationID : defaultDestinationId,
+    }));
+    if (selectedLotInventory) {
+      const fallbackLotName = selectedLotInventory.CurrentInternalLot || '';
+      setLotSearchText(preserveText ?? fallbackLotName);
+    } else {
+      setLotSearchText('');
+    }
+    if (selectedLotInventory?.PartNumber) {
+      setSelectedInventoryItem({
+        inventoryId: Number(selectedLotInventory.LotInventoryID),
+        sku: selectedLotInventory.PartNumber || '',
+        name: selectedLotInventory.PartName || selectedLotInventory.PartNumber || '',
+        stock: selectedLotInventory.CurrentQuantity || 0,
+        locationName: selectedLotInventory.CurrentLocationID ? (locationNames[selectedLotInventory.CurrentLocationID] || String(selectedLotInventory.CurrentLocationID)) : undefined,
+        unitType: selectedLotInventory.UnitType || 'u',
+      });
+    } else {
+      setSelectedInventoryItem(null);
+    }
+  };
+
   async function loadRequestTypes() {
     try {
       const r = await fetch('/api/request-types');
       const d = await r.json();
       const allTypes = Array.isArray(d.requestTypes) ? d.requestTypes : [];
-      const isConsumption = (label?: string) => {
-        if (!label) return false;
-        const key = String(label).toLowerCase();
-        return key.includes('consum') || key.includes('consumption') || key.includes('consumo');
-      };
-      // Exclude consumption-type from the general Requests create/select UI
-      setRequestTypes(allTypes.filter((t: any) => !isConsumption(t.RequestType)));
+      // Exclude consumption-type and the unsupported PDA request types from the general Requests UI
+      setRequestTypes(allTypes.filter((t: any) => !isHiddenRequestType(t.RequestType || t.RequestDescription)));
     } catch (e) {
       console.error('Error loading request types', e);
     }
@@ -134,6 +300,35 @@ export const Requests: React.FC = () => {
     } catch (e) {
       console.error('Error loading lots', e);
       setLots([]);
+    }
+  }
+
+  async function loadLotInventoryOptions() {
+    try {
+      const r = await fetch('/api/requests/lots?limit=100');
+      const d = await r.json();
+      const nextOptions = Array.isArray(d.lots)
+        ? d.lots
+            .filter((lot: any) =>
+              lot?.CurrentLocationID != null &&
+              lot?.CurrentLocationID !== '' &&
+              Number(lot?.CurrentQuantity ?? lot?.Quantity ?? 0) > 0
+            )
+            .map((lot: any) => ({
+              LotInventoryID: lot.LotInventoryID,
+              LotReceiveID: lot.ReceiveID,
+              CurrentInternalLot: lot.CurrentInternalLot || lot.InternalLot || lot.ShortInternalLot || lot.ProviderLot || `Lote ${lot.ReceiveID || lot.LotInventoryID}`,
+              CurrentQuantity: lot.CurrentQuantity ?? lot.Quantity ?? 0,
+              CurrentLocationID: lot.CurrentLocationID ?? null,
+              PartNumber: lot.PartNumber,
+              PartName: lot.PartName || lot.PartNumber || '',
+              UnitType: lot.UnitType || 'u',
+            }))
+        : [];
+      setLotInventoryOptions(nextOptions);
+    } catch (e) {
+      console.error('Error loading lot inventory options', e);
+      setLotInventoryOptions([]);
     }
   }
 
@@ -160,17 +355,12 @@ export const Requests: React.FC = () => {
       setLoading(true);
     }
     try {
-      await Promise.all([loadLocationNames(), loadRequestTypes(), loadLots(), loadInventoryOptions()]);
+      await Promise.all([loadLocationNames(), loadRequestTypes(), loadLots(), loadLotInventoryOptions(), loadInventoryOptions()]);
       const r = await fetch('/api/requests?limit=100');
       const d = await r.json();
       const all = Array.isArray(d.requests) ? d.requests : [];
-      const isConsumption = (label?: string) => {
-        if (!label) return false;
-        const key = String(label).toLowerCase();
-        return key.includes('consum') || key.includes('consumption') || key.includes('consumo');
-      };
-      // Remove requests that are handled by the Salidas (consumption) module
-      setRequests(all.filter((req: any) => !isConsumption(req.RequestTypeName || req.RequestTypeDescription)));
+      // Remove requests that are handled by the Salidas module and those that should not appear in the PDA Requests UI
+      setRequests(all.filter((req: any) => !isHiddenRequestType(req.RequestTypeName || req.RequestTypeDescription)));
     } catch (e) {
       console.error(e);
       if (showLoading) {
@@ -185,26 +375,56 @@ export const Requests: React.FC = () => {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+
+    const selectedRequestTypeId = Number(form.RequestTypeID);
     const normalizedPartNumber = form.PartNumber.trim();
     const normalizedQty = Number(form.Quantity);
 
-    if (!normalizedPartNumber || !Number.isFinite(normalizedQty) || normalizedQty <= 0) {
+    if (selectedRequestTypeId === 2 || selectedRequestTypeId === 12) {
+      const selectedLotInventory = lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(form.LotReceiveID));
+      if (!selectedLotInventory) {
+        alert('Selecciona un lote de inventario para la transferencia');
+        return;
+      }
+      if (!selectedLotInventory.PartNumber) {
+        alert('No se pudo identificar el producto del lote seleccionado');
+        return;
+      }
+      if (!Number.isFinite(normalizedQty) || normalizedQty <= 0) {
+        alert('Ingresa una cantidad válida');
+        return;
+      }
+      if (selectedRequestTypeId === 12 && maxAllowedQuantity != null && normalizedQty > maxAllowedQuantity) {
+        alert(`La cantidad no puede superar el stock disponible en el lote (${maxAllowedQuantity}).`);
+        return;
+      }
+      if (selectedRequestTypeId === 12 && !isStorageLocationName(locationNames[selectedLotInventory.CurrentLocationID ?? 0])) {
+        alert('Para transferencias parciales solo se puede seleccionar un lote que esté en Storage.');
+        return;
+      }
+    } else if (!normalizedPartNumber || !Number.isFinite(normalizedQty) || normalizedQty <= 0) {
       alert('Ingresa un producto y una cantidad válida');
       return;
     }
 
     setSubmitting(true);
     try {
+      const selectedLotInventory = selectedRequestTypeId === 2 || selectedRequestTypeId === 12
+        ? lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(form.LotReceiveID)) || null
+        : null;
       const payload = {
-        RequestTypeID: Number(form.RequestTypeID) || 2,
+        RequestTypeID: selectedRequestTypeId || 2,
         RequestStatusID: 40,
-        PartNumber: normalizedPartNumber,
-        Quantity: normalizedQty,
+        PartNumber: selectedLotInventory?.PartNumber || normalizedPartNumber,
+        Quantity: selectedRequestTypeId === 2
+          ? (selectedLotInventory ? Number(selectedLotInventory.CurrentQuantity || 0) : normalizedQty)
+          : normalizedQty,
         RegUserID: user?.id ? Number(user.id) : undefined,
         Comments: form.Comments.trim() || undefined,
-        SourceLocationID: form.SourceLocationID ? Number(form.SourceLocationID) : undefined,
+        SourceLocationID: selectedLotInventory?.CurrentLocationID ? Number(selectedLotInventory.CurrentLocationID) : (form.SourceLocationID ? Number(form.SourceLocationID) : undefined),
         DestinationLocationID: form.DestinationLocationID ? Number(form.DestinationLocationID) : undefined,
-        LotReceiveID: form.RequestTypeID === '6' && form.LotReceiveID ? Number(form.LotReceiveID) : undefined,
+        LotReceiveID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 12) && selectedLotInventory?.LotReceiveID ? Number(selectedLotInventory.LotReceiveID) : (form.RequestTypeID === '6' && form.LotReceiveID ? Number(form.LotReceiveID) : undefined),
+        LotInventoryID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 12) && selectedLotInventory?.LotInventoryID ? Number(selectedLotInventory.LotInventoryID) : undefined,
       };
 
       const r = await fetch('/api/requests', {
@@ -231,6 +451,23 @@ export const Requests: React.FC = () => {
 
   const availableStock = selectedInventoryItem ? Number(selectedInventoryItem.stock || 0) : null;
   const maxAllowedQuantity = availableStock && Number.isFinite(availableStock) ? Math.max(1, availableStock) : undefined;
+  const isFullTransferRequest = form.RequestTypeID === '2';
+  const isPartialTransferRequest = form.RequestTypeID === '12';
+  const isTransferRequest = isFullTransferRequest || isPartialTransferRequest;
+  const isStorageLocationName = (locationName?: string) => {
+    const normalized = String(locationName || '').toLowerCase();
+    return /stor|almac/.test(normalized);
+  };
+
+  const filteredLotOptions = lotInventoryOptions.filter((lot) => {
+    const search = lotSearchText.trim().toLowerCase();
+    if (!search) return true;
+    const haystack = `${lot.CurrentInternalLot || ''} ${lot.PartNumber || ''} ${lot.PartName || ''} ${lot.CurrentQuantity ?? ''} ${lot.CurrentLocationID ?? ''}`.toLowerCase();
+    return haystack.includes(search);
+  });
+  const visibleLotOptions = isPartialTransferRequest
+    ? filteredLotOptions.filter((lot) => isStorageLocationName(locationNames[lot.CurrentLocationID ?? 0]))
+    : filteredLotOptions;
   const visibleGroups = statusFilter === 'all'
     ? [
         { id: 40, title: 'Pendientes', accent: 'amber' as const },
@@ -242,6 +479,10 @@ export const Requests: React.FC = () => {
   const destinationOptionsForSelectedSource = selectedSourceLocationName
     ? (destinationOptionsBySource[selectedSourceLocationName] || [])
     : destinationLocations;
+  const incomingBridge = new URLSearchParams(location.search).get('from') === 'inbound';
+  const outboundBridge = new URLSearchParams(location.search).get('from') === 'outbound';
+  const defaultInboundDestinationId = destinationLocations.find((location) => /stor|almac/i.test(String(location.LocationName || '')))?.LocationID?.toString() || '';
+  const defaultOutboundDestinationId = destinationLocations.find((location) => /(produ|production|producción|produccion)/i.test(String(location.LocationName || '')))?.LocationID?.toString() || '';
 
   function getStatusMeta(status?: number) {
     switch (status) {
@@ -282,29 +523,70 @@ export const Requests: React.FC = () => {
                 </select>
               </div>
 
-              <div className="space-y-2">
-                <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Producto</label>
-                <select
-                  value={form.PartNumber}
-                  onChange={(e) => {
-                    const nextPart = e.target.value.toUpperCase();
-                    const matched = inventoryOptions.find((item) => item.sku.toUpperCase() === nextPart);
-                    setSelectedInventoryItem(matched || null);
-                    setForm((prev) => ({ ...prev, PartNumber: nextPart }));
-                  }}
-                  className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
-                >
-                  <option value="">Selecciona un producto del inventario</option>
-                  {inventoryOptions.map((item) => (
-                    <option key={item.inventoryId} value={item.sku}>{item.sku} - {item.name} ({item.stock} {item.unitType || 'u'})</option>
-                  ))}
-                </select>
-                {selectedInventoryItem ? (
-                  <p className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">
-                    Inventario real: {selectedInventoryItem.stock} {selectedInventoryItem.unitType || 'u'} • {selectedInventoryItem.locationName || 'Sin ubicación'}
-                  </p>
-                ) : null}
-              </div>
+              {!(form.RequestTypeID === '2' || form.RequestTypeID === '12') ? (
+                <div className="space-y-2">
+                  <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Producto</label>
+                  <select
+                    value={form.PartNumber}
+                    onChange={(e) => {
+                      const nextPart = e.target.value.toUpperCase();
+                      const matched = inventoryOptions.find((item) => item.sku.toUpperCase() === nextPart);
+                      setSelectedInventoryItem(matched || null);
+                      setForm((prev) => ({ ...prev, PartNumber: nextPart }));
+                    }}
+                    className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+                  >
+                    <option value="">Selecciona un producto del inventario</option>
+                    {inventoryOptions.map((item) => (
+                      <option key={item.inventoryId} value={item.sku}>{item.sku} - {item.name} ({item.stock} {item.unitType || 'u'})</option>
+                    ))}
+                  </select>
+                  {selectedInventoryItem ? (
+                    <p className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">
+                      Inventario real: {selectedInventoryItem.stock} {selectedInventoryItem.unitType || 'u'} • {selectedInventoryItem.locationName || 'Sin ubicación'}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {(form.RequestTypeID === '2' || form.RequestTypeID === '12') && (
+                <div className="space-y-2">
+                  <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Lote de inventario / transferencia</label>
+                  <input
+                    ref={lotSearchInputRef}
+                    type="text"
+                    autoComplete="off"
+                    value={lotSearchText}
+                    onChange={(e) => handleLotSearchChange(e.target.value)}
+                    onInput={(e) => handleLotSearchChange((e.target as HTMLInputElement).value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && visibleLotOptions.length === 1) {
+                        e.preventDefault();
+                        selectLotById(visibleLotOptions[0].LotInventoryID, lotSearchText);
+                      }
+                    }}
+                    placeholder="Escribe el lote y selecciónalo"
+                    className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+                  />
+                  {lotSearchText.trim() ? (
+                    <div className="max-h-48 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                      {visibleLotOptions.length > 0 ? visibleLotOptions.map((lot) => (
+                        <button
+                          key={lot.LotInventoryID}
+                          type="button"
+                          onClick={() => selectLotById(lot.LotInventoryID)}
+                          className="w-full rounded-xl px-3 py-2 text-left text-sm font-medium text-slate-700 transition-colors hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700"
+                        >
+                          {getLotOptionLabel(lot)}
+                        </button>
+                      )) : (
+                        <p className="px-3 py-2 text-sm text-slate-500 dark:text-slate-400">No hay lotes que coincidan con la búsqueda.</p>
+                      )}
+                    </div>
+                  ) : null}
+                  <p className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">Escribe el lote y elige la coincidencia para llenar automáticamente el producto, la cantidad y la ubicación de origen.</p>
+                </div>
+              )}
 
               {form.RequestTypeID === '6' && (
                 <div className="space-y-2">
@@ -327,21 +609,23 @@ export const Requests: React.FC = () => {
               )}
 
               <div className="space-y-2">
-                <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Cantidad parcial</label>
+                <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Cantidad</label>
                 <input
                   type="number"
                   min="1"
                   max={maxAllowedQuantity ? String(maxAllowedQuantity) : undefined}
                   value={form.Quantity}
+                  readOnly={isFullTransferRequest}
+                  disabled={isFullTransferRequest}
                   onChange={(e) => {
                     const rawValue = e.target.value;
                     const nextValue = maxAllowedQuantity ? Math.min(Number(rawValue || 0), maxAllowedQuantity) : Number(rawValue || 0);
                     setForm((prev) => ({ ...prev, Quantity: Number.isFinite(nextValue) && nextValue > 0 ? String(nextValue) : '1' }));
                   }}
-                  className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+                  className={`w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100 ${isFullTransferRequest ? 'bg-slate-100 text-slate-500 cursor-not-allowed dark:bg-slate-700/70 dark:text-slate-400' : ''}`}
                 />
                 {maxAllowedQuantity ? (
-                  <p className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">La cantidad parcial debe ajustarse al inventario disponible del producto seleccionado.</p>
+                  <p className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">{isFullTransferRequest ? 'La cantidad se toma directamente del lote seleccionado.' : 'La cantidad parcial puede ajustarse hasta el stock disponible del lote seleccionado.'}</p>
                 ) : null}
               </div>
 
@@ -349,11 +633,12 @@ export const Requests: React.FC = () => {
                 <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Ubicación origen</label>
                 <select
                   value={form.SourceLocationID}
+                  disabled={isTransferRequest}
                   onChange={(e) => {
                     const nextValue = e.target.value;
                     setForm((prev) => ({ ...prev, SourceLocationID: nextValue, DestinationLocationID: '' }));
                   }}
-                  className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+                  className={`w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100 ${isTransferRequest ? 'bg-slate-100 text-slate-500 cursor-not-allowed dark:bg-slate-700/70 dark:text-slate-400' : ''}`}
                 >
                   <option value="">Sin origen</option>
                   {sourceLocations.map((location) => (
@@ -365,15 +650,24 @@ export const Requests: React.FC = () => {
               <div className="space-y-2">
                 <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Ubicación destino</label>
                 <select
-                  value={form.DestinationLocationID}
-                  onChange={(e) => setForm((prev) => ({ ...prev, DestinationLocationID: e.target.value }))}
-                  className="w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+                  value={incomingBridge ? (form.DestinationLocationID || defaultInboundDestinationId) : outboundBridge ? (form.DestinationLocationID || defaultOutboundDestinationId) : form.DestinationLocationID}
+                  onChange={(e) => {
+                    if (incomingBridge || outboundBridge) return;
+                    setForm((prev) => ({ ...prev, DestinationLocationID: e.target.value }));
+                  }}
+                  disabled={incomingBridge || outboundBridge}
+                  className={`w-full bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-4 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100 ${(incomingBridge || outboundBridge) ? 'bg-slate-100 text-slate-500 cursor-not-allowed dark:bg-slate-700/70 dark:text-slate-400' : ''}`}
                 >
                   <option value="">Sin destino</option>
                   {destinationOptionsForSelectedSource.map((location) => (
                     <option key={location.LocationID} value={location.LocationID}>{location.LocationName}</option>
                   ))}
                 </select>
+                {(incomingBridge || outboundBridge) ? (
+                  <p className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">
+                    El destino viene fijado por el flujo de {incomingBridge ? 'Entradas' : 'Salidas'} y no se puede cambiar.
+                  </p>
+                ) : null}
               </div>
 
               <div className="space-y-2">
@@ -534,14 +828,16 @@ export const Requests: React.FC = () => {
                                   <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
                                     {req.RequestTypeName || req.RequestTypeDescription || 'Solicitud'}
                                   </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => window.location.href = `/transfers?requestId=${req.RequestID}`}
-                                    className="flex items-center gap-2 rounded-2xl bg-slate-900 px-3 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95"
-                                  >
-                                    <span>Transferir</span>
-                                    <ChevronRight size={16} />
-                                  </button>
+                                  {group.id === 41 ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => window.location.href = `/transfers?requestId=${req.RequestID}`}
+                                      className="flex items-center gap-2 rounded-2xl bg-slate-900 px-3 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95"
+                                    >
+                                      <span>Transferir</span>
+                                      <ChevronRight size={16} />
+                                    </button>
+                                  ) : null}
                                 </div>
                               </motion.div>
                             );

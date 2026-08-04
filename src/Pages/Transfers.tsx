@@ -14,6 +14,20 @@ type Req = {
   Quantity: number;
   SourceLocationID?: number;
   DestinationLocationID?: number;
+  LotInventoryID?: number;
+  LotReceiveID?: number;
+  RequestStatusID?: number;
+  RequestTypeID?: number;
+};
+
+type LotTraceability = {
+  ReceiveID?: number;
+  LotInventoryID?: number;
+  CurrentLocationID?: number;
+  InternalLot?: string;
+  ProviderLot?: string;
+  ShortInternalLot?: string;
+  LocationName?: string;
 };
 
 type StorageLocation = {
@@ -35,11 +49,10 @@ export const Transfers: React.FC = () => {
   const [executing, setExecuting] = useState<number | null>(null);
   const [locationNames, setLocationNames] = useState<Record<number, string>>({});
   const [showStorageModal, setShowStorageModal] = useState(false);
-  const [storageLocations, setStorageLocations] = useState<StorageLocation[]>([]);
-  const [loadingStorage, setLoadingStorage] = useState(false);
-  const [selectedStorageLocation, setSelectedStorageLocation] = useState<StorageLocation | null>(null);
   const [currentRequest, setCurrentRequest] = useState<Req | null>(null);
   const [quantityInput, setQuantityInput] = useState('');
+  const [lotTraceabilityByRequest, setLotTraceabilityByRequest] = useState<Record<number, LotTraceability | null>>({});
+  const [defaultTransferQtyByRequest, setDefaultTransferQtyByRequest] = useState<Record<number, number>>({});
 
   useEffect(() => { void load(); }, []);
 
@@ -73,6 +86,9 @@ export const Transfers: React.FC = () => {
             Quantity: Number(req.Quantity || 0),
             SourceLocationID: req.SourceLocationID || undefined,
             DestinationLocationID: req.DestinationLocationID || undefined,
+            LotInventoryID: req.LotInventoryID ? Number(req.LotInventoryID) : undefined,
+            LotReceiveID: req.LotReceiveID ? Number(req.LotReceiveID) : undefined,
+            RequestStatusID: req.RequestStatusID ? Number(req.RequestStatusID) : undefined,
           };
           void execute(normalized);
         }
@@ -98,22 +114,50 @@ export const Transfers: React.FC = () => {
     }
   }
 
-  async function loadStorageLocations() {
-    setLoadingStorage(true);
+  async function loadLotTraceability(requestList: Req[]) {
+    const uniqueParts = Array.from(new Set(requestList.map((request) => String(request.PartNumber || '').trim()).filter(Boolean)));
+    if (uniqueParts.length === 0) {
+      setLotTraceabilityByRequest({});
+      return;
+    }
+
     try {
-      const r = await fetch('/api/storage-locations?limit=500');
-      const d = await r.json();
-      if (r.ok) {
-        setStorageLocations(Array.isArray(d?.locations) ? d.locations : []);
-      } else {
-        alert('Error cargando ubicaciones: ' + (d.message || 'Unknown error'));
-        setStorageLocations([]);
-      }
+      const traceabilityByPart = await Promise.all(uniqueParts.map(async (partNumber) => {
+        try {
+          const r = await fetch(`/api/requests/lots?partNumber=${encodeURIComponent(partNumber)}&limit=50`);
+          if (!r.ok) return { partNumber, lots: [] as LotTraceability[] };
+          const d = await r.json();
+          return { partNumber, lots: Array.isArray(d?.lots) ? d.lots : [] as LotTraceability[] };
+        } catch (e) {
+          console.error('Error loading lot traceability', e);
+          return { partNumber, lots: [] as LotTraceability[] };
+        }
+      }));
+
+      const nextMap: Record<number, LotTraceability | null> = {};
+      const defaultQtyByRequest: Record<number, number> = {};
+      const byPart = new Map(traceabilityByPart.map((entry) => [entry.partNumber, entry.lots]));
+
+      requestList.forEach((request) => {
+        const partNumber = String(request.PartNumber || '').trim();
+        const lots = byPart.get(partNumber) || [];
+        const candidate = lots.find((lot) => {
+          const lotInventoryId = request.LotInventoryID != null ? String(request.LotInventoryID) : '';
+          const lotReceiveId = request.LotReceiveID != null ? String(request.LotReceiveID) : '';
+          const candidateInventoryId = lot.LotInventoryID != null ? String(lot.LotInventoryID) : '';
+          const candidateReceiveId = lot.ReceiveID != null ? String(lot.ReceiveID) : '';
+          return Boolean((lotInventoryId && candidateInventoryId && lotInventoryId === candidateInventoryId) || (lotReceiveId && candidateReceiveId && lotReceiveId === candidateReceiveId));
+        }) || null;
+        nextMap[request.RequestID] = candidate;
+        const lotQty = candidate?.CurrentQuantity != null ? Number(candidate.CurrentQuantity) : null;
+        defaultQtyByRequest[request.RequestID] = Number.isFinite(lotQty) && lotQty > 0 ? lotQty : Number(request.Quantity || 0);
+      });
+
+      setLotTraceabilityByRequest(nextMap);
+      setDefaultTransferQtyByRequest(defaultQtyByRequest);
     } catch (e) {
-      console.error('Error loading storage locations', e);
-      setStorageLocations([]);
-    } finally {
-      setLoadingStorage(false);
+      console.error('Error loading lot traceability', e);
+      setLotTraceabilityByRequest({});
     }
   }
 
@@ -123,44 +167,63 @@ export const Transfers: React.FC = () => {
     }
     try {
       await loadLocationNames();
-      // Solo se ejecutan transferencias ya aprobadas por el ERP (estado 41)
-      const r = await fetch('/api/requests?status=41&requestTypeId=2');
+      // Solo se ejecutan transferencias ya aprobadas por el ERP (estado 41) y de tipos transferibles para salidas/transferencias
+      const r = await fetch('/api/requests?status=41');
       const d = await r.json();
-      setRequests(d.requests || []);
+      const nextRequests = ((d.requests || []) as Req[]).filter((req) => [2, 3, 12].includes(Number(req.RequestTypeID || 0)));
+      setRequests(nextRequests);
+      await loadLotTraceability(nextRequests);
     } catch (e) {
       console.error(e);
     } finally { if (showLoading) { setLoading(false); } }
   }
 
+  const isScrapOrQuarantineLocation = (locationName?: string) => {
+    const value = String(locationName || '').toLowerCase();
+    return [
+      'quarantine',
+      'quarentine',
+      'purg',
+      'cuarentena',
+      'purgue',
+    ].some((token) => value.includes(token));
+  };
+
+  const isQuarantineDestination = currentRequest?.DestinationLocationID
+    ? isScrapOrQuarantineLocation(locationNames[currentRequest.DestinationLocationID] || '')
+    : false;
+
   async function execute(req: Req) {
-    // Mostrar el modal para seleccionar la ubicación y capturar la cantidad ya movida físicamente
     setCurrentRequest(req);
     setShowStorageModal(true);
-    setSelectedStorageLocation(null);
-    setQuantityInput(String(req.Quantity ?? ''));
-    await loadStorageLocations();
+    const defaultQty = defaultTransferQtyByRequest[req.RequestID] ?? Number(req.Quantity || 0);
+    setQuantityInput(String(defaultQty));
   }
 
   async function executeTransferWithLocation() {
-    if (!currentRequest || !selectedStorageLocation) {
-      alert('Debes seleccionar una ubicación');
+    if (!currentRequest) {
+      alert('No hay solicitud seleccionada.');
       return;
     }
-
     const parsedQuantity = Number(quantityInput);
     if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
       alert('Ingresa la cantidad realmente transferida');
       return;
     }
 
-    if (!confirm(`${t('transfers.confirmExecute')}\n${currentRequest.PartNumber} x ${parsedQuantity}\nUbicación: ${selectedStorageLocation.RackName}`)) return;
+    const locationLabel = currentRequest.DestinationLocationID
+      ? (locationNames[currentRequest.DestinationLocationID] || `#${currentRequest.DestinationLocationID}`)
+      : 'Sin destino definido';
+
+    if (!confirm(`${t('transfers.confirmExecute')}\n${currentRequest.PartNumber} x ${parsedQuantity}\nDestino: ${locationLabel}\n\nPara salidas parciales, el lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada.`)) return;
 
     try {
       setExecuting(currentRequest.RequestID);
       const body = {
         regUserId: user?.id || null,
-        destinationStorageId: selectedStorageLocation.StorageID,
         quantity: parsedQuantity,
+        sourceLocationId: currentRequest.SourceLocationID || null,
+        destinationLocationId: currentRequest.DestinationLocationID || null,
       };
       const r = await fetch(`/api/requests/${currentRequest.RequestID}/execute-transfer`, {
         method: 'POST',
@@ -205,53 +268,72 @@ export const Transfers: React.FC = () => {
           </div>
         ) : (
           requests.map((r) => (
-            <div key={r.RequestID} className="w-full rounded-[1.5rem] border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
+            <div key={r.RequestID} className="w-full overflow-hidden rounded-[1.5rem] border border-slate-200 bg-gradient-to-br from-white to-slate-50 p-4 shadow-sm dark:border-slate-700 dark:from-slate-800/95 dark:to-slate-900/90">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0 flex-1 space-y-3">
+                  <div className="space-y-1">
                     <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">
                       Solicitud #{r.RequestID}
                     </span>
+                    <div className="break-words text-base font-black leading-snug text-slate-900 dark:text-slate-100">
+                      {r.PartNumber}
+                    </div>
                   </div>
-                  <div className="mt-2 text-base font-black text-slate-900 dark:text-slate-100">
-                    {r.PartNumber}
-                  </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
-                    <span className="rounded-full bg-slate-100 px-2 py-1 font-semibold dark:bg-slate-700/70">
+
+                  <div className="flex flex-col gap-2 text-sm text-slate-600 dark:text-slate-300">
+                    <span className="w-fit rounded-full bg-slate-100 px-2.5 py-1 font-semibold dark:bg-slate-700/70">
                       Cantidad: {r.Quantity}
                     </span>
-                    {r.SourceLocationID ? (
-                      <span className="rounded-full bg-blue-50 px-2 py-1 font-semibold text-blue-700 dark:bg-blue-500/10 dark:text-blue-300">
-                        Origen: {locationNames[r.SourceLocationID] || `#${r.SourceLocationID}`}
-                      </span>
-                    ) : null}
-                    {r.DestinationLocationID ? (
-                      <span className="rounded-full bg-emerald-50 px-2 py-1 font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">
-                        Destino: {locationNames[r.DestinationLocationID] || `#${r.DestinationLocationID}`}
-                      </span>
-                    ) : null}
+                    <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                      {r.SourceLocationID ? (
+                        <span className="w-fit rounded-full bg-blue-50 px-2.5 py-1 font-semibold text-blue-700 break-words dark:bg-blue-500/10 dark:text-blue-300">
+                          Origen: {locationNames[r.SourceLocationID] || `#${r.SourceLocationID}`}
+                        </span>
+                      ) : null}
+                      {r.DestinationLocationID ? (
+                        <span className="w-fit rounded-full bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700 break-words dark:bg-emerald-500/10 dark:text-emerald-300">
+                          Destino: {locationNames[r.DestinationLocationID] || `#${r.DestinationLocationID}`}
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
+
                   {r.RequestName ? (
-                    <div className="mt-3 text-xs font-medium text-slate-500 dark:text-slate-400">
+                    <div className="rounded-2xl border border-slate-200 bg-white/80 p-3 break-words text-xs font-medium leading-relaxed text-slate-500 dark:border-slate-700 dark:bg-slate-700/50 dark:text-slate-400">
                       {r.RequestName}
                     </div>
                   ) : null}
+
+                  {lotTraceabilityByRequest[r.RequestID] ? (
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs leading-relaxed text-slate-600 dark:border-slate-700 dark:bg-slate-700/50 dark:text-slate-300">
+                      <div className="font-black uppercase tracking-[0.2em] text-slate-400">Trazabilidad de lote</div>
+                      <div className="mt-1 break-words font-semibold text-slate-800 dark:text-slate-100">
+                        Lote: {lotTraceabilityByRequest[r.RequestID]?.InternalLot || lotTraceabilityByRequest[r.RequestID]?.ProviderLot || lotTraceabilityByRequest[r.RequestID]?.ShortInternalLot || `#${lotTraceabilityByRequest[r.RequestID]?.ReceiveID || lotTraceabilityByRequest[r.RequestID]?.LotInventoryID || 'n/a'}`}
+                      </div>
+                      <div className="mt-1 break-words">
+                        Ubicación actual: {lotTraceabilityByRequest[r.RequestID]?.CurrentLocationID ? (locationNames[lotTraceabilityByRequest[r.RequestID]?.CurrentLocationID as number] || `#${lotTraceabilityByRequest[r.RequestID]?.CurrentLocationID}`) : 'Sin ubicación registrada'}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <button
-                    disabled={executing === r.RequestID}
-                    onClick={() => execute(r)}
-                    className="flex items-center gap-2 rounded-2xl bg-blue-600 px-4 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95 disabled:opacity-70"
-                  >
-                    {executing === r.RequestID ? (
-                      '...'
-                    ) : (
-                      <>
-                        <Check size={14} />
-                        <span>Empezar transferencia</span>
-                      </>
-                    )}
-                  </button>
+
+                <div className="flex shrink-0 items-center justify-end gap-2 sm:justify-start">
+                  {Number(r.RequestStatusID) === 41 ? (
+                    <button
+                      disabled={executing === r.RequestID}
+                      onClick={() => execute(r)}
+                      className="flex items-center gap-2 rounded-2xl bg-blue-600 px-4 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95 disabled:opacity-70"
+                    >
+                      {executing === r.RequestID ? (
+                        '...'
+                      ) : (
+                        <>
+                          <Check size={14} />
+                          <span>Empezar transferencia</span>
+                        </>
+                      )}
+                    </button>
+                  ) : null}
                   <ArrowRight size={18} className="text-slate-400" />
                 </div>
               </div>
@@ -272,9 +354,9 @@ export const Transfers: React.FC = () => {
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.9, opacity: 0 }}
-            className="w-full max-w-md rounded-[2rem] bg-white p-6 shadow-2xl dark:bg-slate-800"
+            className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-6 shadow-2xl dark:bg-slate-800"
           >
-            <div className="flex items-center justify-between mb-4">
+            <div className="mb-4 flex items-center justify-between gap-3">
               <h2 className="text-lg font-black text-slate-900 dark:text-slate-100">
                 Seleccionar Ubicación
               </h2>
@@ -286,46 +368,48 @@ export const Transfers: React.FC = () => {
               </button>
             </div>
 
-            {loadingStorage ? (
-              <div className="py-8 text-center text-slate-500">Cargando ubicaciones...</div>
-            ) : storageLocations.length === 0 ? (
-              <div className="py-8 text-center text-slate-500">
-                No hay ubicaciones disponibles
+            {currentRequest ? (
+              <div className="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-700/50">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Trazabilidad del movimiento</div>
+                <div className="mt-1 break-words text-sm font-semibold leading-snug text-slate-800 dark:text-slate-100">
+                  {currentRequest.PartNumber}
+                </div>
+                {(() => {
+                  const traceability = currentRequest ? lotTraceabilityByRequest[currentRequest.RequestID] : null;
+                  return traceability ? (
+                    <>
+                      <div className="mt-1 break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                        Lote: {traceability.InternalLot || traceability.ProviderLot || traceability.ShortInternalLot || `#${traceability.ReceiveID || traceability.LotInventoryID || 'n/a'}`}
+                      </div>
+                      <div className="mt-1 break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                        Ubicación actual: {traceability.CurrentLocationID ? (locationNames[traceability.CurrentLocationID] || `#${traceability.CurrentLocationID}`) : 'Sin ubicación registrada'}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="mt-1 break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">No hay trazabilidad de lote asociada a esta solicitud.</div>
+                  );
+                })()}
+                <div className="mt-2 break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                  Destino sugerido: {currentRequest.DestinationLocationID ? (locationNames[currentRequest.DestinationLocationID] || `#${currentRequest.DestinationLocationID}`) : 'Sin destino definido'}
+                </div>
               </div>
-            ) : (
-              <div className="space-y-2 max-h-96 overflow-y-auto">
-                {storageLocations.map((loc) => (
-                  <button
-                    key={loc.StorageID}
-                    onClick={() => setSelectedStorageLocation(loc)}
-                    className={`w-full rounded-xl p-3 text-left transition-all ${
-                      selectedStorageLocation?.StorageID === loc.StorageID
-                        ? 'bg-blue-600 text-white shadow-lg'
-                        : 'bg-slate-50 text-slate-900 border border-slate-200 dark:bg-slate-700 dark:text-slate-100 dark:border-slate-600'
-                    }`}
-                  >
-                    <div className="font-bold">
-                      {loc.RackName || `Rack ${loc.StorageID}`}
-                    </div>
-                    <div className="text-sm opacity-75">
-                      {loc.LocationName ? `${loc.LocationName} • ` : ''}
-                      Col {loc.RackColumn} - Cel {loc.RackCell}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
+            ) : null}
+
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-500/10 dark:text-amber-100">
+              Para salidas, no se requiere elegir un rack. El lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada en la solicitud.
+            </div>
 
             <div className="mt-4 space-y-2">
-              <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-1">Cantidad realmente transferida</label>
+              <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-1">Cantidad a descontar</label>
               <input
                 type="number"
                 min="0.0001"
                 step="any"
                 value={quantityInput}
-                onChange={(e) => setQuantityInput(e.target.value)}
-                className="w-full bg-white dark:bg-slate-700 border-2 border-slate-100 dark:border-slate-600 rounded-xl py-3 px-4 focus:border-blue-500 outline-none transition-all font-medium text-slate-900 dark:text-slate-100"
+                readOnly
+                className="w-full bg-slate-100 dark:bg-slate-700 border-2 border-slate-200 dark:border-slate-600 rounded-xl py-3 px-4 font-medium text-slate-900 dark:text-slate-100 cursor-not-allowed"
               />
+              <p className="text-xs text-slate-500 dark:text-slate-400">Se usa la cantidad registrada en la solicitud. No cambia la ubicación del lote cuando es una salida parcial.</p>
             </div>
 
             <div className="mt-6 flex gap-3">
@@ -337,7 +421,7 @@ export const Transfers: React.FC = () => {
               </button>
               <button
                 onClick={executeTransferWithLocation}
-                disabled={!selectedStorageLocation || executing !== null}
+                disabled={executing !== null}
                 className="flex-1 rounded-xl bg-blue-600 px-4 py-2 font-bold text-white transition-all active:scale-95 disabled:opacity-50"
               >
                 {executing !== null ? 'Ejecutando...' : 'Ejecutar'}

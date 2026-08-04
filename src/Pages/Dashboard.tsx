@@ -174,10 +174,10 @@ export const Dashboard: React.FC = () => {
         <div className="grid grid-cols-2 gap-3">
           <button
             type="button"
-            onClick={() => navigate('/orders/inbound?status=Pendiente%20de%20entrega')}
+            onClick={() => navigate('/orders/inbound?status=pending')}
             className="bg-white/95 dark:bg-slate-800/95 dark:border-slate-700 dark:shadow-slate-950/30 p-4 rounded-3xl border border-slate-200/90 shadow-[0_6px_18px_rgba(15,23,42,0.06)] text-left"
           >
-            <p className="text-[10px] font-black text-slate-400 dark:text-slate-300 uppercase tracking-wider mb-1">{t('dashboard.pending')}</p>
+            <p className="text-[10px] font-black text-slate-400 dark:text-slate-300 uppercase tracking-wider mb-1">Entradas Activas</p>
             <div className="flex items-end justify-between">
               <span className="text-2xl font-black text-slate-900 dark:text-slate-100">{loading ? '…' : pendingOrders}</span>
               <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-500/15 px-2 py-1 rounded-lg">{t('dashboard.orders')}</span>

@@ -32,6 +32,9 @@ export const Inventory: React.FC = () => {
   const { t } = useTranslation();
   const location = useLocation();
   const [inventory, setInventory] = useState<InventoryRow[]>([]);
+  const PAGE_SIZE = 10;
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<'all' | 'low' | 'critical'>('all');
   const [loading, setLoading] = useState(true);
@@ -54,19 +57,31 @@ export const Inventory: React.FC = () => {
     }
   }, [location.search]);
 
-  const loadInventory = async (showLoading = true) => {
+  const loadInventory = async (showLoading = true, reset = false) => {
     try {
       if (showLoading) {
         setLoading(true);
       }
 
-      const response = await fetch('/api/inventory?limit=500');
+      const currentOffset = reset ? 0 : offset;
+      const q = new URLSearchParams();
+      q.set('limit', String(PAGE_SIZE));
+      q.set('offset', String(currentOffset));
+      if (search) q.set('search', search);
+      const response = await fetch(`/api/inventory?${q.toString()}`);
       if (!response.ok) {
         throw new Error('No fue posible cargar el inventario');
       }
 
       const data = await response.json();
-      setInventory(Array.isArray(data.inventory) ? data.inventory : []);
+      const rows = Array.isArray(data.inventory) ? data.inventory : [];
+      if (reset) {
+        setInventory(rows);
+      } else {
+        setInventory((prev) => [...prev, ...rows]);
+      }
+      setHasMore(rows.length === PAGE_SIZE);
+      setOffset((prev) => (reset ? rows.length : prev + rows.length));
       setError('');
     } catch (err) {
       if (showLoading) {
@@ -80,8 +95,13 @@ export const Inventory: React.FC = () => {
   };
 
   useEffect(() => {
-    void loadInventory(true);
+    void loadInventory(true, true);
   }, []);
+
+  useEffect(() => {
+    // when search or filter changes, reload from start
+    void loadInventory(true, true);
+  }, [search, filter]);
 
   useAppRefresh(() => {
     void loadInventory(false);
@@ -260,6 +280,19 @@ export const Inventory: React.FC = () => {
                 <Package size={40} className="text-slate-300 dark:text-slate-400" />
               </div>
               <p className="text-slate-500 dark:text-slate-300 font-bold">No se encontraron registros</p>
+            </div>
+          )}
+        </div>
+        <div className="mt-4">
+          {hasMore && (
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={() => void loadInventory(true, false)}
+                className="px-6 py-2 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-bold"
+              >
+                Cargar más
+              </button>
             </div>
           )}
         </div>

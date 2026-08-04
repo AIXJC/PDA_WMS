@@ -8,6 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import * as erpClient from "./erpClient.js";
 import { buildInboundTransferRequestPayload } from './receiptFlow.js';
+import { shouldApplyInventoryUpdate, upsertInventoryFromLot } from './inventoryFlow.js';
 
 dotenv.config({ path: "server/.env" });
 dotenv.config();
@@ -18,7 +19,7 @@ const app = express();
 // Allow overriding the listen port via `API_PORT` for running parallel instances
 const port = Number(process.env.API_PORT || process.env.PORT || 3001);
 const host = process.env.HOST || '0.0.0.0';
-const MAX_LIMIT = 500;
+const MAX_LIMIT = 1000;
 
 const configKeys = new Set([
   'DB_HOST',
@@ -113,6 +114,12 @@ function getLimit(value, fallback = 100) {
   const parsed = Number(value || fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, MAX_LIMIT);
+}
+
+function getOffset(value, fallback = 0) {
+  const parsed = Number(value || fallback);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.max(0, parsed);
 }
 
 function getSearch(value) {
@@ -302,6 +309,35 @@ async function resolveLotMeta(lotReceiveId) {
   return rows[0] || null;
 }
 
+async function resolveLotLocationId(lotReceiveId, lotInventoryId = null) {
+  const numericLotReceiveId = Number(lotReceiveId);
+  const numericLotInventoryId = Number(lotInventoryId);
+
+  if (Number.isInteger(numericLotInventoryId) && numericLotInventoryId > 0) {
+    const [rows] = await pool.query(`
+      SELECT CurrentLocationID
+      FROM MES_LOT_INVENTORY
+      WHERE LotInventoryID = ?
+      LIMIT 1
+    `, [numericLotInventoryId]);
+
+    if (rows[0]?.CurrentLocationID != null) return Number(rows[0].CurrentLocationID);
+  }
+
+  if (Number.isInteger(numericLotReceiveId) && numericLotReceiveId > 0) {
+    const [rows] = await pool.query(`
+      SELECT CurrentLocationID
+      FROM MES_LOT_INVENTORY
+      WHERE LotReceiveID = ?
+      LIMIT 1
+    `, [numericLotReceiveId]);
+
+    if (rows[0]?.CurrentLocationID != null) return Number(rows[0].CurrentLocationID);
+  }
+
+  return null;
+}
+
 async function findStorageLocationForPart(partNumber) {
   const [rows] = await pool.query(`
     SELECT inv.RackLocationID
@@ -399,16 +435,10 @@ app.get("/api/modules", (_req, res) => {
 });
 
 app.get("/api/dashboard", asyncRoute(async (_req, res) => {
-  const pendingDeliveryStatusId = getOrderStatusIdByKey('Pendiente de entrega', 'ERP_PURCHASE_RECEIPT')
-    ?? getOrderStatusIdByKey('pendiente de entrega', 'ERP_PURCHASE_RECEIPT')
-    ?? getOrderStatusIdByKey('pendiente', 'ERP_PURCHASE_RECEIPT')
-    ?? getOrderStatusIdByKey('pending', 'ERP_PURCHASE_RECEIPT')
-    ?? null;
-
   const [
     inventorySummary,
     criticalInventory,
-    pendingOrdersCount,
+    inboundRows,
   ] = await Promise.all([
     query(`
       SELECT
@@ -423,14 +453,28 @@ app.get("/api/dashboard", asyncRoute(async (_req, res) => {
       FROM MES_INVENTORY
       WHERE Quantity <= 0
     `),
-    pendingDeliveryStatusId === null
-      ? Promise.resolve([{ inboundReceipts: 0 }])
-      : query(`
-          SELECT COUNT(*) AS inboundReceipts
-          FROM ERP_PURCHASE_ORDER
-          WHERE OrderStatusID = ?
-        `, [pendingDeliveryStatusId]),
+    query(`
+      SELECT
+        req.RequestID,
+        req.RequestStatusID,
+        req.LotInventoryID,
+        src.LocationName AS SourceLocationName,
+        dest.LocationName AS DestinationLocationName
+      FROM INVENTORY_REQUESTS req
+      LEFT JOIN PLANT_LOCATIONS src ON src.LocationID = req.SourceLocationID
+      LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
+      WHERE req.RequestStatusID IN (40, 41)
+        AND req.LotInventoryID IS NOT NULL
+        AND req.LotInventoryID > 0
+        AND LOWER(COALESCE(src.LocationName, '')) LIKE '%incoming%'
+        AND LOWER(COALESCE(dest.LocationName, '')) LIKE '%storage%'
+      ORDER BY req.SubmitDate DESC, req.RequestID DESC
+    `),
   ]);
+
+  const approvedInboundCount = Array.isArray(inboundRows)
+    ? inboundRows.filter((row) => Number(row.RequestStatusID) === 41).length
+    : 0;
 
   res.json({
     inventory: {
@@ -443,7 +487,7 @@ app.get("/api/dashboard", asyncRoute(async (_req, res) => {
     workOrdersByStatus: [],
     shippingByStatus: [],
     receiptsByStatus: [],
-    inboundReceipts: pendingOrdersCount[0]?.inboundReceipts || 0,
+    inboundReceipts: approvedInboundCount,
     scrap: { rows: 0, totalQuantity: 0 },
   });
 }));
@@ -487,7 +531,8 @@ app.get("/api/inventory", asyncRoute(async (req, res) => {
     params.push(req.query.partType);
   }
 
-  params.push(limit);
+  const offset = Number(req.query.offset || 0) || 0;
+  params.push(limit, offset);
 
   const rows = await query(`
     SELECT
@@ -516,6 +561,7 @@ app.get("/api/inventory", asyncRoute(async (req, res) => {
     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
     ORDER BY inv.LastUpdate DESC, inv.PartNumber ASC
     LIMIT ?
+    OFFSET ?
   `, params);
 
   res.json({ count: rows.length, inventory: rows });
@@ -697,6 +743,7 @@ app.get("/api/scanner/:code", asyncRoute(async (req, res) => {
 
 app.get("/api/cyclic-count", asyncRoute(async (req, res) => {
   const limit = getLimit(req.query.limit, 100);
+  const offset = Number(req.query.offset || 0) || 0;
   const rows = await query(`
     SELECT
       cc.CycleCountID,
@@ -732,7 +779,8 @@ app.get("/api/cyclic-count", asyncRoute(async (req, res) => {
       s.StatusDescription
     ORDER BY cc.CycleCountID DESC
     LIMIT ?
-  `, [limit]);
+    OFFSET ?
+  `, [limit, offset]);
 
   res.json({
     count: rows.length,
@@ -762,19 +810,18 @@ app.get("/api/cyclic-count/:id/items", asyncRoute(async (req, res) => {
       mmi.PartType,
       mmi.UnitType,
       mi.Quantity AS CurrentQuantity,
-      mi.LotInventoryID,
+      NULL AS LotInventoryID,
       sl.RackName,
       sl.RackColumn,
       sl.RackCell,
       pl.LocationName,
-      li.LotReceiveID,
-      li.CurrentInternalLot,
-      li.CurrentQuantity AS LotCurrentQuantity
+      NULL AS LotReceiveID,
+      NULL AS CurrentInternalLot,
+      NULL AS LotCurrentQuantity
     FROM MES_INVENTORY mi
     LEFT JOIN MES_MASTER_ITEMS mmi ON mmi.PartNumber = mi.PartNumber
     LEFT JOIN STORAGE_LOCATIONS sl ON sl.StorageID = mi.RackLocationID
     LEFT JOIN PLANT_LOCATIONS pl ON pl.LocationID = sl.LocationID
-    LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = mi.LotInventoryID
     WHERE mi.RackLocationID = ?
     ORDER BY mi.PartNumber
   `, [cycle.LocationID]);
@@ -788,6 +835,28 @@ app.get("/api/cyclic-count/:id/items", asyncRoute(async (req, res) => {
     },
     items,
   });
+}));
+
+app.post("/api/cyclic-count/:id/cancel", asyncRoute(async (req, res) => {
+  const cycleId = Number(req.params.id);
+
+  if (!Number.isFinite(cycleId) || cycleId <= 0) {
+    return res.status(400).json({ message: 'CycleCountID inválido' });
+  }
+
+  const [statusRows] = await pool.query(
+    'SELECT StatusID FROM MES_STATUS WHERE StatusCode = ? LIMIT 1',
+    ['PENDING']
+  );
+
+  const pendingStatusId = Number(statusRows[0]?.StatusID ?? 13);
+
+  await pool.query(
+    'UPDATE MES_CYCLE_COUNTING SET StatusID = ? WHERE CycleCountID = ?',
+    [pendingStatusId, cycleId]
+  );
+
+  res.json({ ok: true, status: 'pending', statusId: pendingStatusId });
 }));
 
 app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
@@ -810,7 +879,7 @@ app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
   const cycle = cycleRows[0];
   const totalScanned = scannedItems.length;
   const statusCompletedId = 46;
-  const adjustmentRequestTypeId = getInventoryRequestTypeIdByKey('ajuste') ?? getInventoryRequestTypeIdByKey('adjustment') ?? 1;
+  const adjustmentRequestTypeId = getInventoryRequestTypeIdByKey('ajuste') ?? getInventoryRequestTypeIdByKey('adjustment') ?? 7;
 
   const [storageRows] = await pool.query(
     'SELECT LocationID FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1',
@@ -836,7 +905,7 @@ app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
       if (Number.isNaN(inventoryId) || inventoryId <= 0) continue;
 
       const [inventoryRows] = await connection.query(
-        'SELECT InventoryID, PartNumber, Quantity, LotInventoryID FROM MES_INVENTORY WHERE InventoryID = ? LIMIT 1',
+        'SELECT InventoryID, PartNumber, Quantity FROM MES_INVENTORY WHERE InventoryID = ? LIMIT 1',
         [inventoryId]
       );
       const inventoryRow = inventoryRows[0];
@@ -869,8 +938,9 @@ app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
             SourceLocationID,
             DestinationLocationID,
             LotInventoryID,
+            SubmitDate,
             Comments
-          ) VALUES (40, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (40, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)
         `, [
           adjustmentRequestTypeId,
           String(inventoryRow.PartNumber || ''),
@@ -880,7 +950,7 @@ app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
           locationIdForMovement,
           locationIdForMovement,
           lotInventoryId || null,
-          `Ajuste de inventario por conteo cíclico (ciclo ${cycleId})`,
+          `CICLE:${cycleId}:DELTA:${adjustmentQty}`,
         ]);
 
         const requestId = requestInsertResult.insertId;
@@ -933,6 +1003,129 @@ app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
   } finally {
     connection.release();
   }
+}));
+
+app.get("/api/cyclic-count/adjustments", asyncRoute(async (req, res) => {
+  const rows = await query(`
+    SELECT
+      req.RequestID,
+      req.RequestStatusID,
+      req.RequestTypeID,
+      req.PartNumber,
+      req.Quantity,
+      req.LotInventoryID,
+      req.RequestName,
+      li.InventoryID AS InventoryID,
+      li.CurrentQuantity AS LotCurrentQuantity,
+      li.CurrentLocationID AS LotCurrentLocationID,
+      item.PartName,
+      status.StatusCode,
+      status.StatusDescription
+    FROM INVENTORY_REQUESTS req
+    LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
+    LEFT JOIN MES_STATUS status ON status.StatusID = req.RequestStatusID
+    WHERE LOWER(COALESCE(req.RequestName, '')) LIKE '%cicle:%'
+      OR LOWER(COALESCE(req.RequestName, '')) LIKE '%ciclo%'
+      OR LOWER(COALESCE(req.RequestName, '')) LIKE '%ajuste%'
+    ORDER BY req.RequestID DESC
+  `);
+
+  res.json({ count: rows.length, adjustments: rows });
+}));
+
+app.post("/api/cyclic-count/adjustments/:id/approve", asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return res.status(400).json({ message: 'ID de ajuste inválido' });
+  }
+
+  const [requestRows] = await pool.query('SELECT * FROM INVENTORY_REQUESTS WHERE RequestID = ? LIMIT 1', [requestId]);
+  const requestRow = requestRows[0];
+  if (!requestRow) return res.status(404).json({ message: 'Solicitud de ajuste no encontrada' });
+
+  const commentText = String(requestRow.RequestName || '');
+  const deltaMatch = commentText.match(/DELTA:([+-]?\d+(?:\.\d+)?)/);
+  const delta = deltaMatch ? Number(deltaMatch[1]) : 0;
+  const lotInventoryId = requestRow.LotInventoryID ? Number(requestRow.LotInventoryID) : null;
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    let inventoryId = null;
+    if (lotInventoryId && Number.isInteger(lotInventoryId) && lotInventoryId > 0) {
+      const [lotRows] = await connection.query(
+        'SELECT InventoryID, CurrentQuantity FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1',
+        [lotInventoryId]
+      );
+      const lotRow = lotRows[0];
+      if (lotRow?.InventoryID) {
+        inventoryId = Number(lotRow.InventoryID);
+      }
+    }
+
+    if (inventoryId) {
+      const [inventoryRows] = await connection.query(
+        'SELECT InventoryID, Quantity FROM MES_INVENTORY WHERE InventoryID = ? LIMIT 1',
+        [inventoryId]
+      );
+      const inventoryRow = inventoryRows[0];
+      if (inventoryRow) {
+        const nextQty = Number(inventoryRow.Quantity || 0) + delta;
+        await connection.query(
+          'UPDATE MES_INVENTORY SET Quantity = ?, LastUpdate = NOW() WHERE InventoryID = ?',
+          [nextQty, inventoryId]
+        );
+      }
+    }
+
+    if (lotInventoryId && Number.isInteger(lotInventoryId) && lotInventoryId > 0) {
+      const [lotRows] = await connection.query(
+        'SELECT CurrentQuantity FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1',
+        [lotInventoryId]
+      );
+      const lotRow = lotRows[0];
+      if (lotRow) {
+        const nextLotQty = Number(lotRow.CurrentQuantity || 0) + delta;
+        await connection.query(
+          'UPDATE MES_LOT_INVENTORY SET CurrentQuantity = ? WHERE LotInventoryID = ?',
+          [nextLotQty, lotInventoryId]
+        );
+      }
+    }
+
+    await connection.query(
+      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, RequestName = ? WHERE RequestID = ?',
+      [`${commentText} | APROBADO`, requestId]
+    );
+
+    await connection.commit();
+    res.json({ ok: true, requestId, appliedDelta: delta });
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}));
+
+app.post("/api/cyclic-count/adjustments/:id/reject", asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return res.status(400).json({ message: 'ID de ajuste inválido' });
+  }
+
+  const [requestRows] = await pool.query('SELECT RequestName FROM INVENTORY_REQUESTS WHERE RequestID = ? LIMIT 1', [requestId]);
+  const requestRow = requestRows[0];
+  if (!requestRow) return res.status(404).json({ message: 'Solicitud de ajuste no encontrada' });
+
+  await pool.query(
+    'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 40, RequestName = ? WHERE RequestID = ?',
+    [`${String(requestRow.RequestName || '')} | DEVUELTO`, requestId]
+  );
+
+  res.json({ ok: true, requestId, status: 'returned' });
 }));
 
 app.post("/api/cyclic-count", asyncRoute(async (req, res) => {
@@ -1011,7 +1204,7 @@ app.post("/api/cyclic-count", asyncRoute(async (req, res) => {
 }));
 
 app.get("/api/storage-locations", asyncRoute(async (req, res) => {
-  const limit = getLimit(req.query.limit, 500);
+  const limit = getLimit(req.query.limit, 1000);
   const rows = await query(`
     SELECT
       storage.StorageID,
@@ -1406,10 +1599,15 @@ app.get("/api/orders/inbound", asyncRoute(async (req, res) => {
     params.push(date);
   }
   if (status) {
-    const statusId = getOrderStatusIdByKey(status, 'ERP_PURCHASE_RECEIPT');
-    if (statusId !== null) {
-      clauses.push('po.OrderStatusID = ?');
-      params.push(statusId);
+    const normalizedStatus = String(status).trim().toLowerCase();
+    if (normalizedStatus === 'all') {
+      // Return all inbound orders regardless of status.
+    } else {
+      const statusId = getOrderStatusIdByKey(status, 'ERP_PURCHASE_RECEIPT');
+      if (statusId !== null) {
+        clauses.push('po.OrderStatusID = ?');
+        params.push(statusId);
+      }
     }
   } else if (pendingDeliveryStatusId !== null) {
     clauses.push('po.OrderStatusID = ?');
@@ -1437,6 +1635,12 @@ app.get("/api/orders/inbound", asyncRoute(async (req, res) => {
         JOIN ERP_PURCHASE_RECEIPT pr ON pr.PurchaseReceiptID = prd.PurchaseReceiptID
         WHERE pr.PurchaseOrderID = po.PurchaseOrderID
       ) AS receivedQty,
+      latestLot.LotReceiveID,
+      latestLot.LotInventoryID,
+      latestLot.CurrentLocationID,
+      latestLot.ProviderLot,
+      latestLot.InternalLot,
+      latestLot.ShortInternalLot,
       po.CreateDate,
       po.UpdateDate
     FROM ERP_PURCHASE_ORDER po
@@ -1445,6 +1649,21 @@ app.get("/api/orders/inbound", asyncRoute(async (req, res) => {
     LEFT JOIN PROVIDERS_MES provider
       ON provider.ProviderID = po.ProviderID
     LEFT JOIN MES_STATUS status ON status.StatusID = po.OrderStatusID
+    LEFT JOIN (
+      SELECT
+        pr.PurchaseOrderID,
+        MAX(lot.LotReceiveID) AS LotReceiveID,
+        MAX(li.LotInventoryID) AS LotInventoryID,
+        MAX(li.CurrentLocationID) AS CurrentLocationID,
+        MAX(lot.ProviderLot) AS ProviderLot,
+        MAX(lot.InternalLot) AS InternalLot,
+        MAX(lot.ShortInternalLot) AS ShortInternalLot
+      FROM ERP_PURCHASE_RECEIPT pr
+      JOIN ERP_PURCHASE_RECEIPT_DETAIL prd ON prd.PurchaseReceiptID = pr.PurchaseReceiptID
+      JOIN SHIPPING_RECEIVING_LOTS lot ON lot.PurchaseReceiptDetailID = prd.PurchaseReceiptDetailID
+      LEFT JOIN MES_LOT_INVENTORY li ON li.LotReceiveID = lot.LotReceiveID
+      GROUP BY pr.PurchaseOrderID
+    ) latestLot ON latestLot.PurchaseOrderID = po.PurchaseOrderID
     ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
     GROUP BY po.PurchaseOrderID
     ORDER BY po.CreateDate DESC
@@ -1525,10 +1744,13 @@ app.get("/api/orders/inbound/:id", asyncRoute(async (req, res) => {
         lot.SerialNumber,
         lot.Quantity AS LotQuantity,
         pr.PurchaseReceiptID,
-        prd.PurchaseReceiptDetailID
+        prd.PurchaseReceiptDetailID,
+        li.LotInventoryID,
+        li.CurrentLocationID
       FROM SHIPPING_RECEIVING_LOTS lot
       JOIN ERP_PURCHASE_RECEIPT_DETAIL prd ON prd.PurchaseReceiptDetailID = lot.PurchaseReceiptDetailID
       JOIN ERP_PURCHASE_RECEIPT pr ON pr.PurchaseReceiptID = prd.PurchaseReceiptID
+      LEFT JOIN MES_LOT_INVENTORY li ON li.LotReceiveID = lot.LotReceiveID
       WHERE pr.PurchaseOrderID = ?
       ORDER BY lot.RegDate DESC, lot.LotReceiveID DESC
     `, [id]),
@@ -1556,11 +1778,24 @@ app.get("/api/orders/inbound/:id", asyncRoute(async (req, res) => {
       LotQuantity: lot?.LotQuantity ?? null,
       PurchaseReceiptDetailID: lot?.PurchaseReceiptDetailID ?? null,
       PurchaseReceiptID: lot?.PurchaseReceiptID ?? null,
+      LotInventoryID: lot?.LotInventoryID ?? null,
+      CurrentLocationID: lot?.CurrentLocationID ?? null,
     };
   });
 
+  const orderHeader = headers[0] ? { ...headers[0] } : null;
+  if (orderHeader && Array.isArray(lots) && lots.length > 0) {
+    const latestLot = lots[0];
+    orderHeader.LotReceiveID = latestLot.LotReceiveID ?? null;
+    orderHeader.LotInventoryID = latestLot.LotInventoryID ?? null;
+    orderHeader.CurrentLocationID = latestLot.CurrentLocationID ?? null;
+    orderHeader.ProviderLot = latestLot.ProviderLot ?? null;
+    orderHeader.InternalLot = latestLot.InternalLot ?? null;
+    orderHeader.ShortInternalLot = latestLot.ShortInternalLot ?? null;
+  }
+
   res.json({
-    order: (headers[0] ? { ...headers[0], StatusDescription: (await query('SELECT StatusDescription, StatusCode FROM MES_STATUS WHERE StatusID = ? LIMIT 1', [headers[0].OrderStatusID]))[0]?.StatusDescription || (await query('SELECT StatusDescription, StatusCode FROM MES_STATUS WHERE StatusID = ? LIMIT 1', [headers[0].OrderStatusID]))[0]?.StatusCode || headers[0].StatusDescription } : null),
+    order: orderHeader ? { ...orderHeader, StatusDescription: (await query('SELECT StatusDescription, StatusCode FROM MES_STATUS WHERE StatusID = ? LIMIT 1', [orderHeader.OrderStatusID]))[0]?.StatusDescription || orderHeader.StatusDescription } : null,
     details: detailsWithLots,
     receipts,
   });
@@ -1999,8 +2234,8 @@ app.post("/api/orders/inbound/:id/confirm", asyncRoute(async (req, res) => {
       const [requestInsertResult] = await pool.query(`
         INSERT INTO INVENTORY_REQUESTS (
           RequestStatusID, RequestTypeID, PartNumber, Quantity,
-          RegUserID, ConfirmUserID, SourceLocationID, DestinationLocationID, LotInventoryID, Comments
-        ) VALUES (40, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          RegUserID, ConfirmUserID, SourceLocationID, DestinationLocationID, LotInventoryID
+        ) VALUES (40, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         transferPayload.RequestTypeID,
         transferPayload.PartNumber,
@@ -2010,7 +2245,6 @@ app.post("/api/orders/inbound/:id/confirm", asyncRoute(async (req, res) => {
         transferPayload.SourceLocationID,
         transferPayload.DestinationLocationID,
         transferPayload.LotReceiveID || null,
-        transferPayload.Comments,
       ]);
 
       const requestId = requestInsertResult.insertId;
@@ -2045,6 +2279,7 @@ app.post("/api/orders/inbound/:id/confirm", asyncRoute(async (req, res) => {
 
 app.get("/api/orders/outbound", asyncRoute(async (req, res) => {
   const limit = getLimit(req.query.limit);
+  const offset = getOffset(req.query.offset);
   const clauses = [];
   const params = [];
 
@@ -2053,7 +2288,9 @@ app.get("/api/orders/outbound", asyncRoute(async (req, res) => {
     params.push(req.query.status);
   }
 
+  // push limit then offset to match placeholders
   params.push(limit);
+  params.push(offset);
   const rows = await query(`
     SELECT
       ship.ShipmentID,
@@ -2076,7 +2313,7 @@ app.get("/api/orders/outbound", asyncRoute(async (req, res) => {
     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
     GROUP BY ship.ShipmentID
     ORDER BY ship.CreatedDate DESC
-    LIMIT ?
+    LIMIT ? OFFSET ?
   `, params);
 
   res.json({ count: rows.length, orders: rows });
@@ -2331,6 +2568,266 @@ app.post("/api/transfers", asyncRoute(async (req, res) => {
   }
 }));
 
+app.get("/api/scrap/requests", asyncRoute(async (req, res) => {
+  const limit = getLimit(req.query.limit, 100);
+  const rows = await query(`
+    SELECT
+      req.RequestID,
+      req.RequestStatusID,
+      req.RequestTypeID,
+      req.PartNumber,
+      item.PartName,
+      req.Quantity,
+      req.LotInventoryID,
+      li.LotReceiveID,
+      li.CurrentInternalLot,
+      li.CurrentQuantity,
+      li.CurrentLocationID,
+      req.SourceLocationID,
+      req.DestinationLocationID,
+      source.LocationName AS SourceLocationName,
+      dest.LocationName AS DestinationLocationName
+    FROM INVENTORY_REQUESTS req
+    LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
+    LEFT JOIN PLANT_LOCATIONS source ON source.LocationID = req.SourceLocationID
+    LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
+    WHERE req.RequestStatusID IN (40, 42)
+      AND (
+        req.RequestTypeID = 6
+        OR req.RequestTypeID = 2
+        OR req.RequestTypeID = 3
+      )
+      AND (
+        LOWER(COALESCE(dest.LocationName, '')) LIKE '%quarantine%'
+        OR LOWER(COALESCE(dest.LocationName, '')) LIKE '%purg%'
+        OR LOWER(COALESCE(dest.LocationName, '')) LIKE '%cuarentena%'
+        OR LOWER(COALESCE(dest.LocationName, '')) LIKE '%purgue%'
+      )
+    ORDER BY req.RequestStatusID ASC, req.RequestID DESC
+    LIMIT ?
+  `, [limit]);
+
+  res.json({ count: rows.length, requests: rows });
+}));
+
+app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.requestId);
+  const { quantity, scrapType, comments, regUserId } = req.body || {};
+
+  if (!Number.isInteger(requestId) || requestId <= 0) {
+    return res.status(400).json({ message: 'RequestID inválido.' });
+  }
+
+  const parsedQty = Number(quantity);
+  if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+    return res.status(400).json({ message: 'La cantidad debe ser mayor a cero.' });
+  }
+
+  const normalizedComments = comments ? String(comments).trim() : null;
+  const normalizedScrapType = scrapType ? String(scrapType).trim() : null;
+  const normalizedUserId = regUserId ? Number(regUserId) : null;
+  if (!normalizedScrapType) {
+    return res.status(400).json({ message: 'Debe indicar un tipo de Scrap.' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [requestRows] = await connection.query(`
+      SELECT
+        req.RequestID,
+        req.RequestTypeID,
+        req.RequestStatusID,
+        req.PartNumber,
+        req.Quantity AS RequestQuantity,
+        req.LotInventoryID,
+        li.CurrentQuantity AS LotCurrentQuantity,
+        li.CurrentLocationID AS LotLocationID,
+        li.CurrentInternalLot
+      FROM INVENTORY_REQUESTS req
+      LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
+      WHERE req.RequestID = ?
+      LIMIT 1
+    `, [requestId]);
+
+    const requestRow = requestRows[0];
+    if (!requestRow) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Solicitud no encontrada.' });
+    }
+
+    const isScrapRequest = Number(requestRow.RequestTypeID) === 6;
+    const isTransferLikeRequest = [2, 3].includes(Number(requestRow.RequestTypeID));
+    if (!isScrapRequest && !isTransferLikeRequest) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'Sólo se pueden procesar solicitudes de Scrap o transferencias hacia cuarentena/purgue.' });
+    }
+    if (![41, 42].includes(Number(requestRow.RequestStatusID))) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'Sólo se pueden procesar solicitudes aprobadas o ejecutadas para Scrap.' });
+    }
+
+    if (!requestRow.LotInventoryID) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'La solicitud no tiene un lote de inventario asociado.' });
+    }
+
+    const [lotRows] = await connection.query(
+      'SELECT LotInventoryID, CurrentQuantity, CurrentLocationID FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
+      [requestRow.LotInventoryID]
+    );
+    const lotRow = lotRows[0];
+    if (!lotRow) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'El lote de inventario asociado no fue encontrado.' });
+    }
+
+    const destinationLocationId = requestRow.DestinationLocationID ? Number(requestRow.DestinationLocationID) : null;
+    const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
+
+    if (destinationLocationId !== null) {
+      if (lotRow.CurrentLocationID == null || Number(lotRow.CurrentLocationID) !== destinationLocationId) {
+        await connection.rollback();
+        return res.status(409).json({ message: 'El lote debe estar en la ubicación de cuarentena/purgue indicada en la solicitud antes de procesar scrap.' });
+      }
+    } else if (sourceLocationId !== null) {
+      if (lotRow.CurrentLocationID == null || Number(lotRow.CurrentLocationID) !== sourceLocationId) {
+        await connection.rollback();
+        return res.status(409).json({ message: 'El lote no está en la ubicación de origen indicada en la solicitud.' });
+      }
+    }
+
+    const availableQty = Number(lotRow.CurrentQuantity || 0);
+    if (availableQty <= 0) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El lote no tiene cantidad disponible para scrap.' });
+    }
+
+    const maxQty = Math.min(availableQty, Number(requestRow.RequestQuantity || 0));
+    if (parsedQty > maxQty) {
+      await connection.rollback();
+      return res.status(400).json({ message: `La cantidad de scrap no puede exceder ${maxQty}.` });
+    }
+
+    const [updateResult] = await connection.query(`
+      UPDATE MES_LOT_INVENTORY
+      SET CurrentQuantity = CurrentQuantity - ?
+      WHERE LotInventoryID = ? AND CurrentQuantity >= ?
+    `, [parsedQty, requestRow.LotInventoryID, parsedQty]);
+
+    if (updateResult.affectedRows === 0) {
+      return res.status(409).json({ message: 'No hay suficiente cantidad disponible en el lote para scrap.' });
+    }
+
+    const [movementResult] = await connection.query(`
+      INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
+        RequestID,
+        PartNumber,
+        StorageID,
+        Quantity,
+        MovementTypeID,
+        SourceLocationID,
+        DestinationLocationID,
+        RegUserID,
+        ConfirmUserID,
+        Comments,
+        OriginalInternalLot,
+        NewInternalLot
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      requestId,
+      requestRow.PartNumber,
+      null,
+      parsedQty,
+      6,
+      sourceLocationId,
+      destinationLocationId,
+      normalizedUserId,
+      normalizedUserId,
+      `${normalizedScrapType}${normalizedComments ? ` | ${normalizedComments}` : ''}`,
+      requestRow.CurrentInternalLot || null,
+      'SCRAP',
+    ]);
+
+    const [scrapResult] = await connection.query(`
+      INSERT INTO MES_SCRAP_AND_DISCREPANCIES (PartNumber, Quantity, LocationID, RegUserID, Comments, MovementID)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [
+      requestRow.PartNumber,
+      parsedQty,
+      destinationLocationId || sourceLocationId || null,
+      normalizedUserId,
+      `${normalizedScrapType}${normalizedComments ? ` | ${normalizedComments}` : ''}`,
+      movementResult.insertId,
+    ]);
+
+    let newScrapRequestId = null;
+    if (!isScrapRequest) {
+      const [scrapLocationRows] = await connection.query(`
+        SELECT LocationID, LocationName
+        FROM PLANT_LOCATIONS
+        WHERE LOWER(LocationName) LIKE '%quarantine rejection%'
+          OR LOWER(LocationName) LIKE '%confirmed scrap%'
+      `);
+
+      const normalizeLocation = (value) => String(value || '').trim().toLowerCase();
+      const scrapSourceLocationRow = scrapLocationRows.find((row) => normalizeLocation(row.LocationName).includes('quarantine rejection'));
+      const scrapDestinationLocationRow = scrapLocationRows.find((row) => normalizeLocation(row.LocationName).includes('confirmed scrap'));
+
+      const scrapSourceLocationId = scrapSourceLocationRow ? Number(scrapSourceLocationRow.LocationID) : 4;
+      const scrapDestinationLocationId = scrapDestinationLocationRow ? Number(scrapDestinationLocationRow.LocationID) : 19;
+
+      const [newRequestResult] = await connection.query(`
+        INSERT INTO INVENTORY_REQUESTS (
+          RequestStatusID,
+          RequestTypeID,
+          PartNumber,
+          Quantity,
+          RegUserID,
+          ConfirmUserID,
+          SourceLocationID,
+          DestinationLocationID,
+          LotInventoryID
+        ) VALUES (40, 6, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        requestRow.PartNumber,
+        parsedQty,
+        normalizedUserId,
+        normalizedUserId,
+        scrapSourceLocationId,
+        scrapDestinationLocationId,
+        requestRow.LotInventoryID,
+      ]);
+
+      newScrapRequestId = newRequestResult.insertId ? Number(newRequestResult.insertId) : null;
+    }
+
+    await connection.query(
+      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 42, ConfirmUserID = ?, SubmitDate = NOW() WHERE RequestID = ?',
+      [normalizedUserId, requestId]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      ok: true,
+      requestId,
+      movementId: movementResult.insertId,
+      scrapId: scrapResult.insertId,
+      newScrapRequestId,
+      deductedQty: parsedQty,
+      remainingLotQuantity: availableQty - parsedQty,
+    });
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}));
+
 app.get("/api/scrap", asyncRoute(async (req, res) => {
   const limit = getLimit(req.query.limit);
   const rows = await query(`
@@ -2359,7 +2856,7 @@ app.get("/api/scrap", asyncRoute(async (req, res) => {
 }));
 
 app.post("/api/scrap", asyncRoute(async (req, res) => {
-  const { partNumber, quantity, locationId, sourceLocationId, destinationLocationId, comments, regUserId } = req.body || {};
+  const { partNumber, quantity, locationId, sourceLocationId, destinationLocationId, comments, regUserId, lotReceiveId, lotInventoryId } = req.body || {};
 
   if (!partNumber || !String(partNumber).trim()) {
     return res.status(400).json({ message: "Debe indicar un producto para registrar la merma." });
@@ -2505,6 +3002,7 @@ app.get("/api/request-types", asyncRoute(async (_req, res) => {
 
 app.get("/api/requests", asyncRoute(async (req, res) => {
   const limit = getLimit(req.query.limit, 100);
+  const offset = getOffset(req.query.offset, 0);
   const clauses = [];
   const params = [];
 
@@ -2518,6 +3016,7 @@ app.get("/api/requests", asyncRoute(async (req, res) => {
   }
 
   params.push(limit);
+  params.push(offset);
   const rows = await query(`
     SELECT
       req.RequestID,
@@ -2547,10 +3046,356 @@ app.get("/api/requests", asyncRoute(async (req, res) => {
     LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
     ORDER BY req.RequestID DESC
-    LIMIT ?
+    LIMIT ? OFFSET ?
   `, params);
 
   res.json({ count: rows.length, requests: rows });
+}));
+
+app.get("/api/requests/inbound", asyncRoute(async (req, res) => {
+  const limit = getLimit(req.query.limit, 100);
+  const offset = getOffset(req.query.offset);
+  const statusQuery = String(req.query.status || '').trim();
+  const normalizedStatus = statusQuery.toLowerCase();
+  let statusId = null;
+
+  if (normalizedStatus) {
+    if (normalizedStatus === 'pending' || normalizedStatus.includes('pend')) {
+      statusId = 41;
+    } else if (normalizedStatus === 'approved' || normalizedStatus.includes('approv')) {
+      statusId = 42;
+    } else {
+      const resolved = getOrderStatusIdByKey(statusQuery, null);
+      if (Number.isFinite(Number(resolved))) {
+        statusId = Number(resolved);
+      }
+    }
+  }
+
+  const params = [];
+  const clauses = [
+    'req.RequestStatusID IN (41, 42)',
+    'req.RequestTypeID IN (2, 12)',
+    'req.LotInventoryID IS NOT NULL',
+    'req.LotInventoryID > 0',
+    "LOWER(COALESCE(src.LocationName, '')) LIKE '%incoming%'",
+    "LOWER(COALESCE(dest.LocationName, '')) LIKE '%storage%'",
+  ];
+
+  if (Number.isFinite(Number(statusId))) {
+    clauses.push('req.RequestStatusID = ?');
+    params.push(statusId);
+  }
+
+  const rows = await query(`
+    SELECT
+      req.RequestID,
+      req.RequestStatusID,
+      status.StatusCode,
+      status.StatusDescription,
+      req.RequestTypeID,
+      type.RequestType AS RequestTypeName,
+      type.RequestDescription AS RequestTypeDescription,
+      req.PartNumber,
+      item.PartName,
+      item.UnitType,
+      req.Quantity,
+      req.RegDate,
+      req.SubmitDate,
+      req.RequestName,
+      req.SourceLocationID,
+      req.DestinationLocationID,
+      req.LotInventoryID,
+      src.LocationName AS SourceLocationName,
+      dest.LocationName AS DestinationLocationName,
+      li.LotReceiveID AS LotReceiveIDFromInventory,
+      li.CurrentLocationID
+    FROM INVENTORY_REQUESTS req
+    LEFT JOIN MES_STATUS status ON status.StatusID = req.RequestStatusID
+    LEFT JOIN INVENTORY_REQUEST_TYPES type ON type.RequestID = req.RequestTypeID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
+    LEFT JOIN PLANT_LOCATIONS src ON src.LocationID = req.SourceLocationID
+    LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
+    LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
+    WHERE ${clauses.join(' AND\n      ')}
+    ORDER BY req.SubmitDate DESC, req.RequestID DESC
+    LIMIT ? OFFSET ?
+  `, [...params, limit, offset]);
+
+  const normalized = (rows || []).map((row) => ({
+    RequestID: Number(row.RequestID),
+    PurchaseOrderID: Number(row.RequestID),
+    PONumber: String(row.RequestName || `REQ-${row.RequestID}`),
+    ProviderName: row.PartName ? String(row.PartName) : 'Incoming → Storage',
+    OrderDate: row.SubmitDate || row.RegDate,
+    ExpectedDate: row.SubmitDate || row.RegDate,
+    OrderStatusID: Number(row.RequestStatusID || 0),
+    StatusCode: row.StatusCode,
+    StatusDescription: row.StatusDescription || 'Aprobada',
+    itemCount: 1,
+    orderedQty: Number(row.Quantity || 0),
+    receivedQty: 0,
+    CreateDate: row.RegDate || row.SubmitDate,
+    UpdateDate: row.SubmitDate || row.RegDate,
+    PartNumber: row.PartNumber,
+    PartName: row.PartName,
+    Quantity: Number(row.Quantity || 0),
+    RequestName: row.RequestName,
+    SourceLocationID: row.SourceLocationID != null ? Number(row.SourceLocationID) : null,
+    DestinationLocationID: row.DestinationLocationID != null ? Number(row.DestinationLocationID) : null,
+    SourceLocationName: row.SourceLocationName,
+    DestinationLocationName: row.DestinationLocationName,
+    LotInventoryID: row.LotInventoryID != null ? Number(row.LotInventoryID) : null,
+    LotReceiveID: row.LotReceiveIDFromInventory != null ? Number(row.LotReceiveIDFromInventory) : null,
+    CurrentLocationID: row.CurrentLocationID != null ? Number(row.CurrentLocationID) : null,
+    RequestTypeName: row.RequestTypeName,
+    RequestTypeDescription: row.RequestTypeDescription,
+  }));
+
+  res.json({ count: normalized.length, orders: normalized });
+}));
+
+app.get('/api/requests/inbound/:id(\\d+)', asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  if (!Number.isInteger(requestId) || requestId <= 0) return res.status(400).json({ message: 'Identificador inválido.' });
+
+  const rows = await query(`
+    SELECT
+      req.RequestID,
+      req.RequestStatusID,
+      status.StatusCode,
+      status.StatusDescription,
+      req.RequestTypeID,
+      type.RequestType AS RequestTypeName,
+      type.RequestDescription AS RequestTypeDescription,
+      req.PartNumber,
+      item.PartName,
+      item.UnitType,
+      req.Quantity,
+      req.RegDate,
+      req.SubmitDate,
+      req.RequestName,
+      req.SourceLocationID,
+      req.DestinationLocationID,
+      req.LotInventoryID,
+      src.LocationName AS SourceLocationName,
+      dest.LocationName AS DestinationLocationName,
+      li.LotReceiveID AS LotReceiveIDFromInventory,
+      li.CurrentLocationID
+    FROM INVENTORY_REQUESTS req
+    LEFT JOIN MES_STATUS status ON status.StatusID = req.RequestStatusID
+    LEFT JOIN INVENTORY_REQUEST_TYPES type ON type.RequestID = req.RequestTypeID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
+    LEFT JOIN PLANT_LOCATIONS src ON src.LocationID = req.SourceLocationID
+    LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
+    LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
+    WHERE req.RequestID = ?
+    LIMIT 1
+  `, [requestId]);
+
+  if (!rows[0]) return res.status(404).json({ message: 'Solicitud de entrada no encontrada.' });
+
+  const row = rows[0];
+  res.json({
+    request: {
+      RequestID: Number(row.RequestID),
+      PurchaseOrderID: Number(row.RequestID),
+      PONumber: String(row.RequestName || `REQ-${row.RequestID}`),
+      ProviderName: row.PartName ? String(row.PartName) : 'Incoming → Storage',
+      OrderDate: row.SubmitDate || row.RegDate,
+      ExpectedDate: row.SubmitDate || row.RegDate,
+      OrderStatusID: Number(row.RequestStatusID || 0),
+      StatusCode: row.StatusCode,
+      StatusDescription: row.StatusDescription || 'Aprobada',
+      itemCount: 1,
+      orderedQty: Number(row.Quantity || 0),
+      receivedQty: 0,
+      CreateDate: row.RegDate || row.SubmitDate,
+      UpdateDate: row.SubmitDate || row.RegDate,
+      PartNumber: row.PartNumber,
+      PartName: row.PartName,
+      Quantity: Number(row.Quantity || 0),
+      RequestName: row.RequestName,
+      SourceLocationID: row.SourceLocationID != null ? Number(row.SourceLocationID) : null,
+      DestinationLocationID: row.DestinationLocationID != null ? Number(row.DestinationLocationID) : null,
+      SourceLocationName: row.SourceLocationName,
+      DestinationLocationName: row.DestinationLocationName,
+      LotInventoryID: row.LotInventoryID != null ? Number(row.LotInventoryID) : null,
+      LotReceiveID: row.LotReceiveIDFromInventory != null ? Number(row.LotReceiveIDFromInventory) : null,
+      CurrentLocationID: row.CurrentLocationID != null ? Number(row.CurrentLocationID) : null,
+      RequestTypeName: row.RequestTypeName,
+      RequestTypeDescription: row.RequestTypeDescription,
+    },
+  });
+}));
+
+app.post('/api/requests/inbound/:id/confirm', asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  const { storageId, quantity, receivedBy, comments, lotReference, sourceLocationId, requestUserId, lotInventoryId } = req.body || {};
+  if (!Number.isInteger(requestId) || requestId <= 0) return res.status(400).json({ message: 'ID de solicitud inválido.' });
+
+  const [requestRows] = await pool.query('SELECT * FROM INVENTORY_REQUESTS WHERE RequestID = ? LIMIT 1', [requestId]);
+  const requestRow = requestRows[0];
+  if (!requestRow) return res.status(404).json({ message: 'Solicitud de entrada no encontrada.' });
+  const statusId = Number(requestRow.RequestStatusID);
+  if (statusId !== 40 && statusId !== 41) return res.status(409).json({ message: 'Solo se pueden confirmar solicitudes en estado pendiente/aprobado.' });
+  if (Number(requestRow.LotInventoryID) <= 0) return res.status(400).json({ message: 'La solicitud no tiene lote válido para recibir.' });
+
+  const parsedStorageId = Number(storageId);
+  if (!Number.isInteger(parsedStorageId) || parsedStorageId <= 0) return res.status(400).json({ message: 'Debe seleccionar una ubicación de rack.' });
+
+  const parsedSourceLocationId = sourceLocationId !== undefined && sourceLocationId !== null && sourceLocationId !== ''
+    ? Number(sourceLocationId)
+    : undefined;
+  const parsedQty = Number(quantity);
+  const effectiveQty = Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : Number(requestRow.Quantity || 0);
+  if (!Number.isFinite(effectiveQty) || effectiveQty <= 0) return res.status(400).json({ message: 'La cantidad debe ser mayor a cero.' });
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [storageRows] = await connection.query('SELECT StorageID, LocationID, RackName FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1', [parsedStorageId]);
+    if (!storageRows[0]) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'La ubicación de rack indicada no existe.' });
+    }
+
+    const partNumber = String(requestRow.PartNumber || '').trim();
+    if (!partNumber) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'La solicitud no tiene producto asociado.' });
+    }
+
+    const [existingInventoryRows] = await connection.query(
+      'SELECT InventoryID, Quantity FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? FOR UPDATE',
+      [partNumber, parsedStorageId]
+    );
+
+    if (existingInventoryRows[0]) {
+      await connection.query(
+        'UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?',
+        [effectiveQty, existingInventoryRows[0].InventoryID]
+      );
+    } else {
+      await connection.query(
+        'INSERT INTO MES_INVENTORY (PartNumber, RackLocationID, Quantity, LastUpdate) VALUES (?, ?, ?, NOW())',
+        [partNumber, parsedStorageId, effectiveQty]
+      );
+    }
+
+    if (requestRow.LotInventoryID) {
+      await connection.query(
+        'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
+        [storageRows[0].LocationID || null, requestRow.LotInventoryID]
+      );
+    }
+
+    const transferPayload = buildInboundTransferRequestPayload({
+      partNumber: String(requestRow.PartNumber || '').trim(),
+      quantity: effectiveQty,
+      sourceLocationId: parsedSourceLocationId,
+      destinationLocationId: storageRows[0].LocationID ? Number(storageRows[0].LocationID) : parsedStorageId,
+      requestUserId: requestUserId !== undefined && requestUserId !== null && requestUserId !== '' ? Number(requestUserId) : (receivedBy ? Number(receivedBy) : null),
+      lotReference: lotReference !== undefined && lotReference !== null && lotReference !== '' ? String(lotReference) : undefined,
+      lotInventoryId: lotInventoryId !== undefined && lotInventoryId !== null && lotInventoryId !== '' ? Number(lotInventoryId) : (requestRow.LotInventoryID ? Number(requestRow.LotInventoryID) : undefined),
+      comments: comments ? String(comments) : 'Recepción confirmada desde Incoming → Storage',
+    });
+
+    let createdTransferRequestId = null;
+    if (transferPayload.PartNumber && transferPayload.SourceLocationID && transferPayload.DestinationLocationID) {
+      const [requestInsertResult] = await connection.query(`
+        INSERT INTO INVENTORY_REQUESTS (
+          RequestStatusID, RequestTypeID, PartNumber, Quantity,
+          RegUserID, ConfirmUserID, SourceLocationID, DestinationLocationID, LotInventoryID, RequestName, Comments
+        ) VALUES (40, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        transferPayload.RequestTypeID,
+        transferPayload.PartNumber,
+        transferPayload.Quantity,
+        transferPayload.RegUserID,
+        transferPayload.RegUserID,
+        transferPayload.SourceLocationID,
+        transferPayload.DestinationLocationID,
+        transferPayload.LotInventoryID ?? null,
+        `Inbound-${requestId}`,
+        transferPayload.Comments || null,
+      ]);
+
+      createdTransferRequestId = Number(requestInsertResult.insertId || 0);
+
+      if (createdTransferRequestId > 0) {
+        try {
+          const erpResult = await erpClient.createStockEntry(createdTransferRequestId);
+          if (!erpResult.ok) {
+            await connection.query('DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ?', [createdTransferRequestId]);
+            createdTransferRequestId = null;
+          }
+        } catch (erpError) {
+          await connection.query('DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ?', [createdTransferRequestId]);
+          createdTransferRequestId = null;
+        }
+      }
+    }
+
+    await connection.query(
+      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, ConfirmUserID = ?, SubmitDate = NOW() WHERE RequestID = ?',
+      [receivedBy ? Number(receivedBy) : null, requestId]
+    );
+
+    if (shouldApplyInventoryUpdate(41, Number(requestRow.RequestTypeID), Number(requestRow.LotInventoryID))) {
+      await upsertInventoryFromLot(connection, {
+        requestId,
+        lotInventoryId: requestRow.LotInventoryID,
+        partNumber: partNumber,
+        quantity: effectiveQty,
+        sourceLocationId: requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null,
+        destinationLocationId: storageRows[0].LocationID ? Number(storageRows[0].LocationID) : parsedStorageId,
+        userId: receivedBy ? Number(receivedBy) : null,
+        comments: comments ? String(comments) : 'Recepción confirmada desde Incoming → Storage',
+        requestStatusId: 41,
+        requestTypeId: Number(requestRow.RequestTypeID),
+      });
+    }
+
+    await connection.query(`
+      INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
+        RequestID, PartNumber, StorageID, Quantity, MovementTypeID,
+        SourceLocationID, DestinationLocationID, RegUserID, ConfirmUserID,
+        Comments, OriginalInternalLot, NewInternalLot
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      requestId,
+      partNumber,
+      parsedStorageId,
+      effectiveQty,
+      2,
+      requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null,
+      requestRow.DestinationLocationID ? Number(requestRow.DestinationLocationID) : null,
+      receivedBy ? Number(receivedBy) : null,
+      receivedBy ? Number(receivedBy) : null,
+      comments ? String(comments) : 'Recepción confirmada desde Incoming → Storage',
+      requestRow.LotInventoryID ? String(requestRow.LotInventoryID) : null,
+      requestRow.LotInventoryID ? String(requestRow.LotInventoryID) : null,
+    ]);
+
+    await connection.commit();
+    res.json({
+      ok: true,
+      requestId,
+      statusName: 'Confirmada',
+      receivedQty: effectiveQty,
+      storageId: parsedStorageId,
+      transferRequestId: createdTransferRequestId,
+      transferRequestCreated: createdTransferRequestId !== null,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('[api] Error confirmando solicitud de entrada:', error);
+    res.status(500).json({ message: error.message || 'No fue posible confirmar la solicitud de entrada.' });
+  } finally {
+    connection.release();
+  }
 }));
 
 app.get('/api/requests/:id(\\d+)', asyncRoute(async (req, res) => {
@@ -2590,6 +3435,49 @@ app.get('/api/requests/:id(\\d+)', asyncRoute(async (req, res) => {
 
   if (!rows[0]) return res.status(404).json({ message: 'Solicitud no encontrada.' });
   res.json({ request: rows[0] });
+}));
+
+app.get("/api/requests/lot-inventory", asyncRoute(async (req, res) => {
+  const limit = getLimit(req.query.limit, 50);
+  const partNumber = getSearch(req.query.partNumber);
+
+  const [rows] = await pool.query(`
+    SELECT
+      li.LotInventoryID,
+      li.LotReceiveID,
+      li.CurrentInternalLot,
+      li.CurrentLocationID,
+      li.CurrentQuantity,
+      li.RegDate,
+      lot.InternalLot,
+      lot.ProviderLot,
+      lot.ShortInternalLot,
+      lot.Quantity AS ReceiveQuantity,
+      detail.PurchaseReceiptDetailID,
+      detail.ItemID,
+      item.PartNumber,
+      item.PartName,
+      item.UnitType
+    FROM MES_LOT_INVENTORY li
+    LEFT JOIN SHIPPING_RECEIVING_LOTS lot ON lot.LotReceiveID = li.LotReceiveID
+    LEFT JOIN ERP_PURCHASE_RECEIPT_DETAIL detail ON detail.PurchaseReceiptDetailID = lot.PurchaseReceiptDetailID
+    LEFT JOIN MES_MASTER_ITEMS item ON item.ItemID = detail.ItemID
+    ${partNumber ? "WHERE item.PartNumber = ?" : ""}
+    ORDER BY li.LotInventoryID DESC
+    LIMIT ?
+  `, partNumber ? [partNumber, limit] : [limit]);
+
+  const normalizedRows = (rows || []).map((row) => ({
+    ...row,
+    LotInventoryID: row.LotInventoryID != null ? Number(row.LotInventoryID) : null,
+    LotReceiveID: row.LotReceiveID != null ? Number(row.LotReceiveID) : null,
+    CurrentLocationID: row.CurrentLocationID != null ? Number(row.CurrentLocationID) : null,
+    CurrentQuantity: row.CurrentQuantity != null ? Number(row.CurrentQuantity) : null,
+    RegDate: row.RegDate || null,
+    ReceiveQuantity: row.ReceiveQuantity != null ? Number(row.ReceiveQuantity) : null,
+  }));
+
+  res.json({ count: normalizedRows.length, lotInventory: normalizedRows });
 }));
 
 app.get("/api/requests/lots", asyncRoute(async (req, res) => {
@@ -2633,15 +3521,19 @@ app.get("/api/requests/lots", asyncRoute(async (req, res) => {
       detail.AcceptedQty,
       detail.RejectedQty,
       li.LotInventoryID AS LotInventoryID,
-      li.CurrentLocationID AS CurrentLocationID
-    FROM SHIPPING_RECEIVING_LOTS lot
+      li.CurrentLocationID AS CurrentLocationID,
+      li.CurrentInternalLot AS CurrentInternalLot,
+      li.CurrentQuantity AS CurrentQuantity
+    FROM MES_LOT_INVENTORY li
+    LEFT JOIN SHIPPING_RECEIVING_LOTS lot ON lot.LotReceiveID = li.LotReceiveID
     LEFT JOIN ERP_PURCHASE_RECEIPT_DETAIL detail ON detail.PurchaseReceiptDetailID = lot.PurchaseReceiptDetailID
     LEFT JOIN ERP_PURCHASE_RECEIPT receipt ON receipt.PurchaseReceiptID = detail.PurchaseReceiptID
     LEFT JOIN ERP_PURCHASE_ORDER po ON po.PurchaseOrderID = receipt.PurchaseOrderID
     LEFT JOIN MES_MASTER_ITEMS item ON item.ItemID = detail.ItemID
-    LEFT JOIN MES_LOT_INVENTORY li ON li.LotReceiveID = lot.LotReceiveID
-    ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-    ORDER BY lot.RegDate DESC
+    WHERE li.CurrentLocationID IS NOT NULL
+      AND COALESCE(li.CurrentQuantity, 0) > 0
+    ${clauses.length ? `AND ${clauses.join(" AND ")}` : ""}
+    ORDER BY li.LotInventoryID DESC
     LIMIT ?
   `, params);
 
@@ -2654,34 +3546,13 @@ app.get("/api/requests/lots", asyncRoute(async (req, res) => {
       ReceiveID: row.ReceiveID != null ? Number(row.ReceiveID) : null,
       LotInventoryID: row.LotInventoryID != null ? Number(row.LotInventoryID) : null,
       CurrentLocationID: row.CurrentLocationID != null ? Number(row.CurrentLocationID) : null,
+      CurrentInternalLot: row.CurrentInternalLot ? String(row.CurrentInternalLot) : null,
+      CurrentQuantity: row.CurrentQuantity != null ? Number(row.CurrentQuantity) : null,
+      inStorage: row.CurrentLocationID != null,
     };
   });
 
-  // Annotate each lot with whether the part is currently present in a PLANT location
-  // that looks like Storage (so we can restrict selectable lots to those in Storage).
-  const lotsWithInStorage = await Promise.all((normalizedRows || []).map(async (lot) => {
-    const part = String(lot.PartNumber || '').trim();
-    if (!part) return { ...lot, inStorage: false };
-    try {
-      const [invRows] = await pool.query(`
-        SELECT 1
-        FROM MES_INVENTORY inv
-        LEFT JOIN STORAGE_LOCATIONS storage ON storage.StorageID = inv.RackLocationID
-        LEFT JOIN PLANT_LOCATIONS plant ON plant.LocationID = storage.LocationID
-        WHERE inv.PartNumber = ?
-          AND (
-            LOWER(plant.LocationName) LIKE '%stor%'
-            OR LOWER(plant.LocationName) LIKE '%almac%'
-          )
-        LIMIT 1
-      `, [part]);
-      return { ...lot, inStorage: Array.isArray(invRows) && invRows.length > 0 };
-    } catch (e) {
-      return { ...lot, inStorage: false };
-    }
-  }));
-
-  res.json({ count: lotsWithInStorage.length, lots: lotsWithInStorage });
+  res.json({ count: normalizedRows.length, lots: normalizedRows });
 }));
 
 app.post("/api/requests", asyncRoute(async (req, res) => {
@@ -2694,6 +3565,7 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     DestinationLocationID,
     LotReceiveID: incomingLotReceiveID,
     LotInventoryID,
+    Comments,
   } = req.body || {};
   let LotReceiveID = incomingLotReceiveID;
 
@@ -2764,15 +3636,23 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     // Map LotReceiveID -> LotInventoryID (MES_LOT_INVENTORY) if available
     if (resolvedLotInventoryId === null) {
       try {
-        const [lotInvRows] = await pool.query(`SELECT LotInventoryID FROM MES_LOT_INVENTORY WHERE LotReceiveID = ? LIMIT 1`, [Number(LotReceiveID)]);
+        const [lotInvRows] = await pool.query(`SELECT LotInventoryID, CurrentLocationID FROM MES_LOT_INVENTORY WHERE LotReceiveID = ? LIMIT 1`, [Number(LotReceiveID)]);
         if (lotInvRows && lotInvRows[0] && lotInvRows[0].LotInventoryID) {
           resolvedLotInventoryId = Number(lotInvRows[0].LotInventoryID);
+          if (!normalizedSourceLocationId && lotInvRows[0].CurrentLocationID != null) {
+            normalizedSourceLocationId = Number(lotInvRows[0].CurrentLocationID);
+          }
         } else {
           // try matching by internal lot string when LotReceiveID isn't present in MES_LOT_INVENTORY
           const candidateRef = String(lotMeta.InternalLot || lotMeta.ProviderLot || '').trim();
           if (candidateRef) {
-            const [byRef] = await pool.query(`SELECT LotInventoryID FROM MES_LOT_INVENTORY WHERE CurrentInternalLot = ? LIMIT 1`, [candidateRef]);
-            if (byRef && byRef[0] && byRef[0].LotInventoryID) resolvedLotInventoryId = Number(byRef[0].LotInventoryID);
+            const [byRef] = await pool.query(`SELECT LotInventoryID, CurrentLocationID FROM MES_LOT_INVENTORY WHERE CurrentInternalLot = ? LIMIT 1`, [candidateRef]);
+            if (byRef && byRef[0] && byRef[0].LotInventoryID) {
+              resolvedLotInventoryId = Number(byRef[0].LotInventoryID);
+              if (!normalizedSourceLocationId && byRef[0].CurrentLocationID != null) {
+                normalizedSourceLocationId = Number(byRef[0].CurrentLocationID);
+              }
+            }
           }
         }
       } catch (e) {
@@ -2857,7 +3737,30 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
       }
     }
 
-    if (normalizedSourceLocationId) {
+    if (normalizedSourceLocationId && resolvedLotInventoryId !== null) {
+      const [lotInvRows] = await pool.query(`
+        SELECT CurrentLocationID, CurrentQuantity
+        FROM MES_LOT_INVENTORY
+        WHERE LotInventoryID = ?
+        LIMIT 1
+      `, [resolvedLotInventoryId]);
+
+      const lotInvRow = lotInvRows[0];
+      if (!lotInvRow || lotInvRow.CurrentLocationID == null || Number(lotInvRow.CurrentQuantity || 0) <= 0) {
+        return res.status(409).json({
+          message: 'El lote indicado no tiene stock en la ubicación de origen seleccionada.',
+          selectedSourceLocationId: normalizedSourceLocationId,
+        });
+      }
+
+      if (Number(lotInvRow.CurrentLocationID) !== normalizedSourceLocationId) {
+        return res.status(409).json({
+          message: 'El lote indicado no está en la ubicación de origen seleccionada.',
+          selectedSourceLocationId: normalizedSourceLocationId,
+          lotCurrentLocationId: Number(lotInvRow.CurrentLocationID),
+        });
+      }
+    } else if (normalizedSourceLocationId) {
         const [invRows] = await pool.query(`
           SELECT 1
           FROM MES_INVENTORY inv
@@ -3094,14 +3997,11 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
     return res.status(400).json({ message: "Identificador de solicitud inválido." });
   }
 
-  const { destinationStorageId, quantity, regUserId, comments } = req.body || {};
-  const parsedStorageId = Number(destinationStorageId);
+  const { destinationStorageId, destinationLocationId, quantity, regUserId, comments } = req.body || {};
+  const parsedDestinationLocationId = destinationLocationId != null ? Number(destinationLocationId) : null;
   const parsedQty = Number(quantity);
   const parsedUserId = regUserId ? Number(regUserId) : null;
 
-  if (!Number.isInteger(parsedStorageId)) {
-    return res.status(400).json({ message: "Debe seleccionar una ubicación de almacenamiento." });
-  }
   if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
     return res.status(400).json({ message: "La cantidad debe ser mayor a cero." });
   }
@@ -3111,101 +4011,83 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
   if (!requestRow) {
     return res.status(404).json({ message: "La solicitud no existe." });
   }
-  // Allow transfer execution for Transfer (2) and Consumption (3) types
-  if (Number(requestRow.RequestTypeID) !== 2 && Number(requestRow.RequestTypeID) !== 3) {
-    return res.status(409).json({ message: "Esta operación solo aplica a solicitudes de Transferencia o Consumo." });
+  // Allow transfer execution for Transfer (2), Consumption (3), Scrap relocation (6), and Partial Transfer (12) types
+  if (![2, 3, 6, 12].includes(Number(requestRow.RequestTypeID))) {
+    return res.status(409).json({ message: "Esta operación solo aplica a solicitudes de Transferencia, Consumo, Transferencia parcial o Scrap." });
   }
   const allowedStatuses = new Set([41, 42]);
   if (!allowedStatuses.has(Number(requestRow.RequestStatusID))) {
     return res.status(409).json({ message: "La solicitud debe estar aprobada o confirmada antes de ejecutar la transferencia." });
   }
 
-  const [storageRows] = await pool.query("SELECT StorageID FROM STORAGE_LOCATIONS WHERE StorageID = ?", [parsedStorageId]);
-  if (!storageRows[0]) {
-    return res.status(404).json({ message: "La ubicación de almacenamiento indicada no existe." });
+  const effectiveDestinationLocationId = Number(requestRow.DestinationLocationID || parsedDestinationLocationId || null) || null;
+  const isQuarantineDestination = effectiveDestinationLocationId != null
+    ? await (async () => {
+        const [locationRows] = await pool.query(
+          "SELECT LocationName FROM PLANT_LOCATIONS WHERE LocationID = ? LIMIT 1",
+          [effectiveDestinationLocationId]
+        );
+        const locationName = String(locationRows[0]?.LocationName || '').toLowerCase();
+        return [
+          'quarantine',
+          'quarentine',
+          'purg',
+          'cuarentena',
+          'purgue',
+        ].some((token) => locationName.includes(token));
+      })()
+    : false;
+
+  if (effectiveDestinationLocationId == null) {
+    return res.status(400).json({ message: "Debe seleccionar una ubicación de destino válida." });
   }
 
-  const partNumber = String(requestRow.PartNumber);
-  const batchNo = await getMostRecentInternalLot(partNumber).catch(() => null);
-
-  const mapResult = await erpClient.storeMaterialInRack({
-    storageId: parsedStorageId,
-    partNumber,
-    quantity: parsedQty,
-    batch: batchNo,
-  });
-
+  const partNumber = String(requestRow.PartNumber || '');
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
 
-    // Decrement source inventory (lock source row) when applicable
-    const sourceRackId = Number(requestRow.SourceLocationID) || null;
-    if (Number.isInteger(sourceRackId) && sourceRackId > 0) {
-      // If the request referenced a LotReceiveID, ensure that lot's part exists in the specified source rack
-      if (requestRow.LotReceiveID) {
-        const lotMeta = await resolveLotMeta(requestRow.LotReceiveID).catch(() => null);
-        if (!lotMeta) {
-          await connection.rollback();
-          return res.status(409).json({ message: 'Lote asociado a la solicitud no encontrado.' });
-        }
-        const [checkRows] = await connection.query(
-          "SELECT 1 FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? LIMIT 1",
-          [String(lotMeta.PartNumber || ''), sourceRackId]
-        );
-        if (!checkRows[0]) {
-          await connection.rollback();
-          return res.status(409).json({ message: 'El lote asociado a la solicitud no tiene stock en la ubicación de origen.' });
-        }
-      }
-      const [sourceRows] = await connection.query(
-        "SELECT InventoryID, Quantity FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? FOR UPDATE",
-        [partNumber, sourceRackId]
-      );
-
-      if (!sourceRows[0]) {
-        await connection.rollback();
-        return res.status(409).json({ message: "No hay inventario disponible en la ubicación de origen." });
-      }
-
-      const sourceQty = Number(sourceRows[0].Quantity) || 0;
-      if (sourceQty < parsedQty) {
-        await connection.rollback();
-        return res.status(409).json({ message: "Stock insuficiente en la ubicación de origen para completar la transferencia." });
-      }
-
-      await connection.query(
-        "UPDATE MES_INVENTORY SET Quantity = Quantity - ?, LastUpdate = NOW() WHERE InventoryID = ?",
-        [parsedQty, sourceRows[0].InventoryID]
-      );
-    }
-
-    // Increment destination inventory (lock/insert dest row)
-    const [existingInventoryRows] = await connection.query(
-      "SELECT InventoryID, Quantity FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? FOR UPDATE",
-      [partNumber, parsedStorageId]
-    );
-
-    if (existingInventoryRows[0]) {
-      await connection.query(
-        "UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?",
-        [parsedQty, existingInventoryRows[0].InventoryID]
-      );
-    } else {
-      await connection.query(
-        "INSERT INTO MES_INVENTORY (PartNumber, RackLocationID, Quantity) VALUES (?, ?, ?)",
-        [partNumber, parsedStorageId, parsedQty]
-      );
-    }
-
-    const submitResult = await erpClient.submitStockEntry({ requestId, quantity: parsedQty, batchNo });
-    if (!submitResult.ok) {
+    if (!requestRow.LotInventoryID) {
       await connection.rollback();
-      return res.status(502).json({
-        message: `No se confirmó la transferencia porque el ERP la rechazó: ${submitResult.message}`,
-        erp: submitResult,
-        mapWarning: mapResult.ok ? null : mapResult.message,
-      });
+      return res.status(400).json({ message: 'La solicitud no tiene un lote de inventario asociado.' });
+    }
+
+    const [lotRows] = await connection.query(
+      'SELECT LotInventoryID, CurrentQuantity, CurrentLocationID FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
+      [requestRow.LotInventoryID]
+    );
+    const lotRow = lotRows[0];
+    if (!lotRow) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'El lote de inventario asociado no fue encontrado.' });
+    }
+
+    const lotCurrentQuantity = Number(lotRow.CurrentQuantity || 0);
+    if (lotCurrentQuantity <= 0) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El lote no tiene cantidad disponible para transferir.' });
+    }
+
+    const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
+    const shouldValidateSourceLocation = !(Number(requestRow.RequestTypeID) === 6 && isQuarantineDestination);
+    if (shouldValidateSourceLocation && sourceLocationId !== null && lotRow.CurrentLocationID != null && Number(lotRow.CurrentLocationID) !== sourceLocationId) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El lote no está en la ubicación de origen indicada en la solicitud.' });
+    }
+
+    let destinationLocationId = effectiveDestinationLocationId;
+
+    if (destinationLocationId == null) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'No se pudo determinar una ubicación de destino para la transferencia.' });
+    }
+
+    const isPartialOutbound = [3, 12].includes(Number(requestRow.RequestTypeID));
+    if (!isPartialOutbound) {
+      await connection.query(
+        'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
+        [destinationLocationId, requestRow.LotInventoryID]
+      );
     }
 
     const normalizedComments = comments ? String(comments).trim() : null;
@@ -3218,7 +4100,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
     `, [
       requestId,
       partNumber,
-      parsedStorageId,
+      null,
       parsedQty,
       2,
       requestRow.SourceLocationID,
@@ -3226,19 +4108,39 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       parsedUserId || requestRow.RegUserID,
       parsedUserId || requestRow.RegUserID,
       normalizedComments,
-      batchNo || partNumber,
+      null,
       'TRANSFER',
     ]);
 
+    const requestStatusBefore = Number(requestRow.RequestStatusID);
+    const [updateRequestStatusResult] = await connection.query(
+      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 42, ConfirmUserID = ?, SubmitDate = NOW() WHERE RequestID = ?',
+      [parsedUserId || requestRow.RegUserID, requestId]
+    );
+
+    if (shouldApplyInventoryUpdate(42, Number(requestRow.RequestTypeID), Number(requestRow.LotInventoryID))) {
+      await upsertInventoryFromLot(connection, {
+        requestId,
+        lotInventoryId: requestRow.LotInventoryID,
+        partNumber: partNumber,
+        quantity: parsedQty,
+        sourceLocationId: requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null,
+        destinationLocationId: destinationLocationId,
+        userId: parsedUserId || requestRow.RegUserID,
+        comments: normalizedComments || 'Transferencia confirmada',
+        requestStatusId: 42,
+        requestTypeId: Number(requestRow.RequestTypeID),
+      });
+    }
+
     await connection.commit();
+
+    console.log(`[transfer] requestId=${requestId} statusBefore=${requestStatusBefore} statusAfter=42 affectedRows=${updateRequestStatusResult.affectedRows}`);
 
     res.json({
       ok: true,
       movementId: movementResult.insertId,
-      stockEntry: submitResult.data?.stock_entry || null,
       quantity: parsedQty,
-      batchNo,
-      mapWarning: mapResult.ok ? null : mapResult.message,
       message: "Transferencia confirmada correctamente.",
     });
   } catch (error) {
@@ -3387,21 +4289,87 @@ app.get('/api/activity-history', asyncRoute(async (req, res) => {
   }
 
   try {
-    // Outbound orders (mock for now as no table exists in schema)
-    const mockOutbound = [
-      { id: 'OUT001', type: 'outbound', reference: 'PICK-4412', timestamp: new Date(Date.now() - 12 * 60000), status: 'inProgress', description: 'Orden de salida', icon: 'ArrowUpCircle', color: 'blue' },
-    ];
-    activities.push(...mockOutbound);
+    const [outboundRows] = await pool.query(`
+      SELECT
+        ship.ShipmentID AS id,
+        ship.ShipmentNumber,
+        ship.CustomerID,
+        ship.ShipmentDate AS createdAt,
+        ship.CreatedDate,
+        ship.ClosedDate,
+        COALESCE(SUM(detail.ScannQty), 0) AS quantity,
+        status.StatusDescription AS statusDescription
+      FROM PART_SHIPPING ship
+      LEFT JOIN PART_SHIPPING_DETAIL detail ON detail.ShipmentID = ship.ShipmentID
+      LEFT JOIN MES_STATUS status ON status.StatusID = ship.StatusID
+      GROUP BY ship.ShipmentID
+      ORDER BY ship.CreatedDate DESC
+      LIMIT ?
+    `, [limit]);
+
+    if (Array.isArray(outboundRows) && outboundRows.length > 0) {
+      activities.push(...outboundRows.map((row) => ({
+        id: `outbound-${row.id}`,
+        type: 'outbound',
+        ref: row.ShipmentNumber || `OUT-${row.id}`,
+        provider: row.CustomerID || 'Cliente',
+        receiver: 'Sin receptor',
+        createdAt: row.CreatedDate || row.createdAt,
+        receivedAt: row.createdAt || row.CreatedDate,
+        updatedAt: row.ClosedDate || row.CreatedDate,
+        description: row.statusDescription || 'Salida',
+        quantity: Number(row.quantity || 0),
+        timestamp: row.createdAt || row.CreatedDate || new Date().toISOString(),
+      })));
+    }
   } catch (err) {
     console.warn('[api] Error en órdenes de salida:', err.message);
   }
 
   try {
-    // Transfers (mock for now)
-    const mockTransfers = [
-      { id: 'TRF001', type: 'transfer', reference: 'TRF-001', timestamp: new Date(Date.now() - 60 * 60000), status: 'completed', description: 'Transferencia', icon: 'MoveHorizontal', color: 'violet' },
-    ];
-    activities.push(...mockTransfers);
+    const [transferRows] = await pool.query(`
+      SELECT
+        mv.MovementID AS id,
+        mv.PartNumber,
+        mv.Quantity,
+        mv.SourceLocationID,
+        mv.DestinationLocationID,
+        mv.RegUserID,
+        mv.Comments,
+        mv.RegDate AS createdAt,
+        mv.ConfirmDate AS updatedAt,
+        reg.FirstName AS RegUserFirstName,
+        reg.LastName AS RegUserLastName,
+        source.LocationName AS SourceLocationName,
+        dest.LocationName AS DestinationLocationName
+      FROM INVENTORY_MOVEMENTS_HISTORY mv
+      LEFT JOIN USERS_MES reg ON reg.UserID = mv.RegUserID
+      LEFT JOIN PLANT_LOCATIONS source ON source.LocationID = mv.SourceLocationID
+      LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = mv.DestinationLocationID
+      WHERE mv.NewInternalLot = 'TRANSFER'
+      ORDER BY mv.RegDate DESC
+      LIMIT ?
+    `, [limit]);
+
+    if (Array.isArray(transferRows) && transferRows.length > 0) {
+      activities.push(...transferRows.map((row) => ({
+        id: `transfer-${row.id}`,
+        type: 'transfer',
+        ref: row.PartNumber || 'Transferencia',
+        provider: 'Transferencia',
+        receiver: row.RegUserFirstName || row.RegUserLastName
+          ? `${row.RegUserFirstName || ''} ${row.RegUserLastName || ''}`.trim()
+          : 'Sin usuario',
+        createdAt: row.createdAt,
+        receivedAt: row.createdAt,
+        updatedAt: row.updatedAt || row.createdAt,
+        description: row.Comments || 'Sin comentarios',
+        quantity: Number(row.Quantity || 0),
+        locationName: [row.SourceLocationName, row.DestinationLocationName].filter(Boolean).join(' → ') || 'Sin ubicación',
+        partNumber: row.PartNumber,
+        timestamp: row.createdAt || row.updatedAt || new Date().toISOString(),
+      })));
+    }
   } catch (err) {
     console.warn('[api] Error en transferencias:', err.message);
   }
@@ -3468,21 +4436,90 @@ app.get('/api/activity-history', asyncRoute(async (req, res) => {
   }
 
   try {
-    // Cyclic counts (mock for now)
-    const mockCyclic = [
-      { id: 'CC001', type: 'cyclic', reference: 'CC-2024-001', timestamp: new Date(Date.now() - 2 * 3600000), status: 'pending', description: 'Conteo cíclico', icon: 'RefreshCw', color: 'cyan' },
-    ];
-    activities.push(...mockCyclic);
+    const [cyclicRows] = await pool.query(`
+      SELECT
+        cc.CycleCountID AS id,
+        cc.LocationID,
+        cc.StatusID,
+        cc.PackCount,
+        cc.InventoryID,
+        sl.RackName,
+        sl.RackColumn,
+        sl.RackCell,
+        status.StatusCode,
+        status.StatusDescription AS status,
+        COUNT(mi.InventoryID) AS itemCount,
+        COALESCE(SUM(COALESCE(mi.Quantity, 0)), 0) AS currentQuantity,
+        cc.PackCount AS packCount,
+        NOW() AS createdAt
+      FROM MES_CYCLE_COUNTING cc
+      LEFT JOIN STORAGE_LOCATIONS sl ON sl.StorageID = cc.LocationID
+      LEFT JOIN MES_STATUS status ON status.StatusID = cc.StatusID
+      LEFT JOIN MES_INVENTORY mi ON mi.RackLocationID = cc.LocationID
+      GROUP BY cc.CycleCountID
+      ORDER BY cc.CycleCountID DESC
+      LIMIT ?
+    `, [limit]);
+
+    if (Array.isArray(cyclicRows) && cyclicRows.length > 0) {
+      activities.push(...cyclicRows.map((row) => ({
+        id: `cyclic-${row.id}`,
+        type: 'cyclic',
+        ref: `${row.RackName || 'Rack'}-${row.RackColumn || 0}-${row.RackCell || 0}`,
+        provider: row.status || 'Conteo cíclico',
+        receiver: 'Conteo cíclico',
+        createdAt: row.createdAt,
+        receivedAt: row.createdAt,
+        updatedAt: row.createdAt,
+        description: `Conteo cíclico en ${row.RackName || 'Rack'} ${row.RackColumn || 0}-${row.RackCell || 0}`,
+        quantity: Number(row.currentQuantity || 0),
+        status: row.status || 'Pendiente',
+        timestamp: row.createdAt || new Date().toISOString(),
+      })));
+    }
   } catch (err) {
     console.warn('[api] Error en conteos cíclicos:', err.message);
   }
 
   try {
-    // Scrap/Merma (mock for now)
-    const mockScrap = [
-      { id: 'SCR001', type: 'scrap', reference: 'SCR-001', timestamp: new Date(Date.now() - 3 * 3600000), status: 'completed', description: 'Merma', icon: 'Trash2', color: 'rose' },
-    ];
-    activities.push(...mockScrap);
+    const [scrapRows] = await pool.query(`
+      SELECT
+        scrap.SADID AS id,
+        scrap.PartNumber,
+        scrap.Quantity,
+        scrap.LocationID,
+        scrap.RegUserID,
+        scrap.Comments,
+        NOW() AS createdAt,
+        reg.FirstName AS RegUserFirstName,
+        reg.LastName AS RegUserLastName,
+        location.LocationName AS LocationName
+      FROM MES_SCRAP_AND_DISCREPANCIES scrap
+      LEFT JOIN USERS_MES reg ON reg.UserID = scrap.RegUserID
+      LEFT JOIN PLANT_LOCATIONS location ON location.LocationID = scrap.LocationID
+      ORDER BY scrap.SADID DESC
+      LIMIT ?
+    `, [limit]);
+
+    if (Array.isArray(scrapRows) && scrapRows.length > 0) {
+      activities.push(...scrapRows.map((row) => ({
+        id: `scrap-${row.id}`,
+        type: 'scrap',
+        ref: row.PartNumber || 'Merma',
+        provider: 'Merma',
+        receiver: row.RegUserFirstName || row.RegUserLastName
+          ? `${row.RegUserFirstName || ''} ${row.RegUserLastName || ''}`.trim()
+          : 'Sin usuario',
+        createdAt: row.createdAt,
+        receivedAt: row.createdAt,
+        updatedAt: row.createdAt,
+        description: row.Comments || 'Sin comentarios',
+        quantity: Number(row.Quantity || 0),
+        locationName: row.LocationName || 'Sin ubicación',
+        partNumber: row.PartNumber,
+        timestamp: row.createdAt || new Date().toISOString(),
+      })));
+    }
   } catch (err) {
     console.warn('[api] Error en merma:', err.message);
   }
@@ -3661,6 +4698,12 @@ app.get("/api/settings/catalogs", asyncRoute(async (_req, res) => {
     try {
       return await query(sql);
     } catch (err) {
+      // If the error indicates a missing table, suppress the noisy warning
+      const code = err && err.code ? String(err.code) : '';
+      const msg = err && err.message ? String(err.message) : '';
+      if (code === 'ER_NO_SUCH_TABLE' || /doesn'?t exist/i.test(msg) || /Unknown table/i.test(msg)) {
+        return [];
+      }
       console.warn('[api] settings catalog query failed:', err.message);
       return [];
     }

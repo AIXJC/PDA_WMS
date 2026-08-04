@@ -28,7 +28,7 @@ try {
 
 export const Scanner: React.FC = () => {
   const { t } = useTranslation();
-  const [isScanning, setIsScanning] = useState(true);
+  const [isScanning, setIsScanning] = useState(false);
   const [lastScanned, setLastScanned] = useState<Product | null>(null);
   const [mode, setMode] = useState<'single' | 'continuous' | 'massive'>('single');
   const [flash, setFlash] = useState(false);
@@ -180,6 +180,23 @@ export const Scanner: React.FC = () => {
       console.error('Scanner lookup failed', err);
     }
   };
+
+  if (!isScanning && !lastScanned) {
+    return (
+      <Layout title={t('scanner.title')} showNav={true}>
+        <div className="flex h-full min-h-[60vh] items-center justify-center px-4">
+          <div className="w-full max-w-md rounded-[2rem] border border-slate-200 bg-white p-6 text-center shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-slate-900 text-white">
+              <Scan size={28} />
+            </div>
+            <p className="text-[10px] font-black uppercase tracking-[0.35em] text-slate-400 dark:text-slate-300">SmartGlasses</p>
+            <h2 className="mt-3 text-xl font-black text-slate-900 dark:text-slate-100">Apartado reservado para SmartGlasses</h2>
+            <p className="mt-3 text-sm font-semibold text-slate-600 dark:text-slate-300">Próximamente V-2.0</p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
 
   return (
     <Layout title={t('scanner.title')} showNav={!isScanning}>

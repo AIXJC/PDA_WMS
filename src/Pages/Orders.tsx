@@ -10,6 +10,7 @@ import {
   User,
   Calendar,
   LoaderCircle,
+  X,
 } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
@@ -39,6 +40,7 @@ interface InboundOrderDetail {
 }
 
 interface InboundOrderSummary {
+  RequestID?: number;
   PurchaseOrderID: number;
   PONumber: string;
   ProviderID: number;
@@ -51,6 +53,12 @@ interface InboundOrderSummary {
   itemCount: number;
   orderedQty: number;
   receivedQty: number;
+  LotReceiveID?: number | null;
+  LotInventoryID?: number | null;
+  CurrentLocationID?: number | null;
+  ProviderLot?: string | null;
+  InternalLot?: string | null;
+  ShortInternalLot?: string | null;
   CreateDate: string;
   UpdateDate: string;
 }
@@ -81,6 +89,11 @@ export const Orders: React.FC = () => {
   const [items] = useState<OrderItem[]>(MOCK_ORDER_ITEMS);
   const [orders, setOrders] = useState<any[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(true);
+  const PAGE_SIZE = 10;
+  const [inboundOffset, setInboundOffset] = useState(0);
+  const [inboundHasMore, setInboundHasMore] = useState(true);
+  const [outboundOffset, setOutboundOffset] = useState(0);
+  const [outboundHasMore, setOutboundHasMore] = useState(true);
   const [error, setError] = useState('');
   const [selectedInboundOrder, setSelectedInboundOrder] = useState<InboundOrderSummary | null>(null);
   const [selectedInboundDetails, setSelectedInboundDetails] = useState<InboundOrderDetail[]>([]);
@@ -102,16 +115,20 @@ export const Orders: React.FC = () => {
   const [scannedCounts, setScannedCounts] = useState<Record<number, number>>({});
   const [historyFilter, setHistoryFilter] = useState<'all' | 'completed' | 'in-progress' | 'pending'>('all');
   const [showQuarantineModal, setShowQuarantineModal] = useState(false);
-  const [quarantineQty, setQuarantineQty] = useState(0);
   const [confirming, setConfirming] = useState(false);
   const [destinationLocationId, setDestinationLocationId] = useState('');
   const [sourceLocationId, setSourceLocationId] = useState('');
+  const [storageLocations, setStorageLocations] = useState<any[]>([]);
+  const [loadingStorageLocations, setLoadingStorageLocations] = useState(false);
+  const [selectedStorageLocation, setSelectedStorageLocation] = useState<any | null>(null);
+  const [rackCodeInput, setRackCodeInput] = useState('');
   const [sourceLocations, setSourceLocations] = useState<Array<{LocationID:number; LocationName:string}>>([]);
   const [destinationLocations, setDestinationLocations] = useState<Array<{LocationID:number; LocationName:string}>>([]);
   const [providerFilter, setProviderFilter] = useState('');
   const [poFilter, setPoFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  const [inboundTab, setInboundTab] = useState<'approved' | 'pending'>('pending');
   const [statusOptions, setStatusOptions] = useState<Array<any>>([]);
   const [outboundStatusOptions, setOutboundStatusOptions] = useState<string[]>([]);
   const requestedStatus = useMemo(() => new URLSearchParams(location.search).get('status') || '', [location.search]);
@@ -138,8 +155,32 @@ export const Orders: React.FC = () => {
     return 'pending';
   };
 
+  
+  const isInboundPending = (order: any) => {
+    const statusId = Number(order?.OrderStatusID ?? order?.RequestStatusID ?? 0);
+    if (statusId === 41) return true; // pendiente
+    if (statusId === 42) return false; // aprobada/ejecutada
+
+    const statusText = String(order?.StatusDescription || order?.StatusCode || '').toLowerCase();
+    return statusText.includes('pendiente') || statusText.includes('pending') || statusText.includes('draft');
+  };
+
+  const inboundPendingOrders = orders.filter((order) => Number(order?.OrderStatusID ?? order?.RequestStatusID ?? 0) === 41);
+  const inboundApprovedOrders = orders.filter((order) => Number(order?.OrderStatusID ?? order?.RequestStatusID ?? 0) === 42);
+
   const isOutbound = type === 'outbound';
   const title = isOutbound ? 'Órdenes de Salida' : 'Órdenes de Entrada';
+
+  // No auto-fallback from approved to pending; the user should remain in the selected tab
+  // so they can see that there are no status 42 orders if none are available.
+  useEffect(() => {
+    if (isOutbound) return;
+  }, [isOutbound]);
+
+  useEffect(() => {
+    // initial load or reload when filters/tab change
+    void loadInboundOrders(true);
+  }, [isOutbound, providerFilter, poFilter, dateFilter, statusFilter, inboundTab]);
   const searchParams = new URLSearchParams(location.search);
   const requestedView = searchParams.get('view');
   const requestedPo = searchParams.get('po');
@@ -159,6 +200,14 @@ export const Orders: React.FC = () => {
 
   useEffect(() => {
     if (isOutbound) return;
+
+    const normalizedStatus = String(requestedStatus || '').trim().toLowerCase();
+    if (normalizedStatus.includes('approv') || normalizedStatus === '41' || normalizedStatus === 'approved') {
+      setInboundTab('approved');
+    } else if (normalizedStatus.includes('pend') || normalizedStatus === '40' || normalizedStatus === 'pending') {
+      setInboundTab('pending');
+    }
+
     if (isInboundDetailRoute) {
       setInboundView('detail');
       setInboundDetailModalOpen(true);
@@ -170,25 +219,18 @@ export const Orders: React.FC = () => {
       setInboundView('history');
       setInboundDetailModalOpen(false);
     }
-  }, [isOutbound, isInboundDetailRoute, detailId, requestedPo, location.search]);
+  }, [isOutbound, isInboundDetailRoute, detailId, requestedPo, location.search, requestedStatus]);
 
   useEffect(() => {
     if (isOutbound || !selectedInboundOrder) return;
 
     const loadDestinationLocations = async () => {
-      try {
-        const response = await fetch('/api/scrap/location-options');
-        if (!response.ok) return;
-        const data = await response.json();
-        const nextSourceLocations = Array.isArray(data.sourceLocations) ? data.sourceLocations : [];
-        const nextDestinationLocations = Array.isArray(data.destinationLocations) ? data.destinationLocations : [];
-        setSourceLocations(nextSourceLocations);
-        setDestinationLocations(nextDestinationLocations);
-        if (!sourceLocationId && nextSourceLocations[0]) {
-          setSourceLocationId(String(nextSourceLocations[0].LocationID));
-        }
-      } catch (error) {
-        console.error('No se pudieron cargar las ubicaciones destino', error);
+      const options = await loadLocationOptions();
+      if (!options) return;
+      const nextSourceLocations = options.sourceLocations;
+      const nextDestinationLocations = options.destinationLocations;
+      if (!sourceLocationId && nextSourceLocations[0]) {
+        setSourceLocationId(String(nextSourceLocations[0].LocationID));
       }
     };
 
@@ -207,28 +249,7 @@ export const Orders: React.FC = () => {
     setLotMode(!isOutbound);
 
     if (isOutbound) {
-      const loadOutboundOrders = async () => {
-        try {
-          setLoadingOrders(true);
-          const params = new URLSearchParams();
-          params.set('limit', '100');
-          if (statusFilter) params.set('status', statusFilter);
-          const response = await fetch(`/api/orders/outbound?${params.toString()}`);
-          if (!response.ok) throw new Error('No fue posible cargar las salidas');
-          const data = await response.json();
-          const nextOrders = Array.isArray(data.orders) ? data.orders : [];
-          setOrders(nextOrders);
-          setOutboundStatusOptions(Array.from(new Set(nextOrders.map((order: any) => String(order.StatusDescription || order.StatusCode || 'Sin estado').trim()).filter(Boolean))));
-        } catch (err) {
-          setError(err instanceof Error ? err.message : 'Error cargando salidas');
-          setOrders([]);
-          setOutboundStatusOptions([]);
-        } finally {
-          setLoadingOrders(false);
-        }
-      };
-
-      void loadOutboundOrders();
+      void loadOutboundOrders(true);
       return;
     }
 
@@ -254,29 +275,83 @@ export const Orders: React.FC = () => {
       }
     })();
 
-    const loadInboundOrders = async () => {
-      try {
+    // loadInboundOrders will be called below (initial load)
+    // (implementation is outside this effect so it can be reused for "Cargar más")
+  }, [isOutbound, providerFilter, poFilter, dateFilter, statusFilter, inboundTab]);
+
+  const loadInboundOrders = async (reset = false) => {
+    if (isOutbound) return;
+    try {
+      if (reset) {
         setLoadingOrders(true);
-        const params = new URLSearchParams();
-        params.set('limit', '100');
-        if (providerFilter) params.set('provider', providerFilter);
-        if (poFilter) params.set('poNumber', poFilter);
-        if (dateFilter) params.set('date', dateFilter);
-        if (statusFilter) params.set('status', statusFilter);
-
-        const response = await fetch(`/api/orders/inbound?${params.toString()}`);
-        if (!response.ok) throw new Error('No fue posible cargar las entradas');
-        const data = await response.json();
-        setOrders(Array.isArray(data.orders) ? data.orders : []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Error cargando entradas');
-      } finally {
-        setLoadingOrders(false);
       }
-    };
 
-    loadInboundOrders();
-  }, [isOutbound, providerFilter, poFilter, dateFilter, statusFilter]);
+      const currentOffset = reset ? 0 : inboundOffset;
+      const params = new URLSearchParams();
+      params.set('limit', String(PAGE_SIZE));
+      params.set('offset', String(currentOffset));
+      const statusParam = statusFilter || requestedStatus;
+      if (statusParam) {
+        params.set('status', statusParam);
+      }
+
+      const response = await fetch(`/api/requests/inbound?${params.toString()}`);
+      if (!response.ok) throw new Error('No fue posible cargar las entradas');
+      const data = await response.json();
+      const nextOrders = Array.isArray(data.orders) ? data.orders : [];
+      if (reset) {
+        setOrders(nextOrders);
+      } else {
+        setOrders((prev) => [...prev, ...nextOrders]);
+      }
+      setInboundHasMore(nextOrders.length === PAGE_SIZE);
+      setInboundOffset((prev) => (reset ? nextOrders.length : prev + nextOrders.length));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error cargando entradas');
+    } finally {
+      if (reset) setLoadingOrders(false);
+    }
+  };
+
+  const loadOutboundOrders = async (reset = false) => {
+    if (!isOutbound) return;
+    try {
+      if (reset) setLoadingOrders(true);
+
+      const currentOffset = reset ? 0 : outboundOffset;
+      const params = new URLSearchParams();
+      params.set('limit', String(PAGE_SIZE));
+      params.set('offset', String(currentOffset));
+      if (statusFilter) params.set('status', statusFilter);
+
+      const response = await fetch(`/api/orders/outbound?${params.toString()}`);
+      if (!response.ok) throw new Error('No fue posible cargar las salidas');
+      const data = await response.json();
+      const nextOrders = Array.isArray(data.orders) ? data.orders : [];
+
+      if (reset) {
+        setOrders(nextOrders);
+      } else {
+        setOrders((prev) => [...prev, ...nextOrders]);
+      }
+
+      // collect status options on first load
+      if (reset) {
+        setOutboundStatusOptions(Array.from(new Set(nextOrders.map((order: any) => String(order.StatusDescription || order.StatusCode || 'Sin estado').trim()).filter(Boolean))));
+      }
+
+      setOutboundHasMore(nextOrders.length === PAGE_SIZE);
+      setOutboundOffset((prev) => (reset ? nextOrders.length : prev + nextOrders.length));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error cargando salidas');
+      if (reset) {
+        setOrders([]);
+        setOutboundStatusOptions([]);
+      }
+    } finally {
+      if (reset) setLoadingOrders(false);
+    }
+  };
 
   useEffect(() => {
     if (isOutbound || !statusOptions.length || !requestedStatus) return;
@@ -295,9 +370,10 @@ export const Orders: React.FC = () => {
 
   const loadInboundOrderDetails = async (purchaseOrderId: number, orderSummary?: Partial<InboundOrderSummary> | null, options?: { resetLot?: boolean }) => {
     const { resetLot = true } = options || {};
-    setSelectedOrder(String(purchaseOrderId));
+    const requestId = Number(purchaseOrderId);
+    setSelectedOrder(String(requestId));
     setInboundView('detail');
-    setSelectedInboundOrder(orderSummary ? ({ ...orderSummary, PurchaseOrderID: purchaseOrderId } as InboundOrderSummary) : null);
+    setSelectedInboundOrder(orderSummary ? ({ ...orderSummary, PurchaseOrderID: requestId } as InboundOrderSummary) : null);
     setSelectedInboundDetails([]);
     setSelectedInboundReceipts([]);
     if (resetLot) {
@@ -308,12 +384,25 @@ export const Orders: React.FC = () => {
     setDetailLoading(true);
 
     try {
-      const response = await fetch(`/api/orders/inbound/${purchaseOrderId}`);
+      const response = await fetch(`/api/requests/inbound/${requestId}`);
       if (!response.ok) throw new Error('No fue posible cargar el detalle de la entrada');
       const data = await response.json();
-      setSelectedInboundOrder({ ...(orderSummary || {}), PurchaseOrderID: purchaseOrderId, ...(data.order || {}) } as InboundOrderSummary);
-      setSelectedInboundDetails(Array.isArray(data.details) ? data.details : []);
-      setSelectedInboundReceipts(Array.isArray(data.receipts) ? data.receipts : []);
+      const request = data.request || null;
+      setSelectedInboundOrder({ ...(orderSummary || {}), PurchaseOrderID: requestId, ...(request || {}) } as InboundOrderSummary);
+      setSelectedInboundDetails(request ? [{
+        PurchaseOrderDetailID: request.RequestID,
+        PurchaseOrderID: request.RequestID,
+        ItemID: request.PartNumber,
+        Qty: Number(request.Quantity || 0),
+        ReceivedQty: 0,
+        PartNumber: request.PartNumber,
+        PartName: request.PartName || request.RequestName || 'Solicitud de entrada',
+        WorkArea: '',
+        PartType: '',
+        MeasureType: '',
+        MeasureDescription: 'pz',
+      }] : []);
+      setSelectedInboundReceipts([]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error cargando detalle');
     } finally {
@@ -348,11 +437,58 @@ export const Orders: React.FC = () => {
       : (Number.isInteger(fallbackPurchaseOrderId) && fallbackPurchaseOrderId > 0 ? fallbackPurchaseOrderId : null);
   };
 
+  const loadLocationOptions = async () => {
+    try {
+      const response = await fetch('/api/scrap/location-options');
+      if (!response.ok) return null;
+      const data = await response.json();
+      const nextSourceLocations = Array.isArray(data.sourceLocations) ? data.sourceLocations : [];
+      const nextDestinationLocations = Array.isArray(data.destinationLocations) ? data.destinationLocations : [];
+      setSourceLocations(nextSourceLocations);
+      setDestinationLocations(nextDestinationLocations);
+      return { sourceLocations: nextSourceLocations, destinationLocations: nextDestinationLocations };
+    } catch (error) {
+      console.error('No se pudieron cargar las ubicaciones para el puente de entradas', error);
+      return null;
+    }
+  };
+
+  const isIncomingLot = (lot: any, resolvedSourceLocations?: Array<{ LocationID?: number; LocationName?: string }>) => {
+    const currentLocationId = Number(lot?.CurrentLocationID ?? 0);
+    const currentLocationName = String(lot?.CurrentLocationName || lot?.LocationName || '').trim().toLowerCase();
+    const candidates = resolvedSourceLocations ?? sourceLocations;
+
+    if (!currentLocationId && !currentLocationName) return false;
+
+    const matched = candidates.some((location) => {
+      const locationId = Number(location?.LocationID ?? 0);
+      const locationName = String(location?.LocationName || '').trim().toLowerCase();
+      return ((locationId > 0 && currentLocationId > 0 && locationId === currentLocationId) || (locationName && currentLocationName && locationName === currentLocationName))
+        && /(incoming|receiving|entrada|recepcion)/i.test(locationName);
+    });
+
+    return matched;
+  };
+
   const handleSelectLot = async (lot: any) => {
     setSelectedLot(lot);
     setSelectedLotDetails(lot);
     setError('');
     setLotInput(String(lot?.ProviderLot || lot?.InternalLot || lot?.ShortInternalLot || lot?.ReceiveID || lot?.LotReceiveID || ''));
+
+    const resolvedLocations = sourceLocations.length > 0 ? sourceLocations : await loadLocationOptions();
+    const resolvedSourceLocations = resolvedLocations && 'sourceLocations' in resolvedLocations
+      ? resolvedLocations.sourceLocations
+      : undefined;
+    if (isIncomingLot(lot, resolvedSourceLocations)) {
+      const params = new URLSearchParams({
+        from: 'inbound',
+        lotInventoryId: String(lot?.LotInventoryID ?? lot?.LotInventoryId ?? ''),
+        lotReference: String(lot?.InternalLot || lot?.ShortInternalLot || lot?.ProviderLot || lot?.LotReceiveID || lot?.ReceiveID || ''),
+      });
+      navigate(`/requests?${params.toString()}`);
+      return;
+    }
 
     const resolvedPurchaseOrderId = resolveLotPurchaseOrderId(lot);
     if (resolvedPurchaseOrderId) {
@@ -448,6 +584,11 @@ export const Orders: React.FC = () => {
     }
   };
 
+  const selectedInboundStatusId = selectedInboundOrder
+    ? Number((selectedInboundOrder as any).RequestStatusID ?? selectedInboundOrder.OrderStatusID ?? 0)
+    : null;
+  const isReadonlyInboundOrder = selectedInboundStatusId === 40 || selectedInboundStatusId === 41 || selectedInboundStatusId === 42;
+
   const inboundSummary = useMemo(() => {
     if (isOutbound || !selectedInboundOrder) return null;
 
@@ -479,6 +620,39 @@ export const Orders: React.FC = () => {
     }, 0);
   }, [selectedInboundDetails, scannedCounts]);
 
+  const getStorageLocationCode = (location: any) => {
+    const rackName = String(location?.RackName || '').trim().toUpperCase();
+    const rackColumn = String(location?.RackColumn ?? 0);
+    const rackCell = String(location?.RackCell ?? 0);
+    return `${rackName}-${rackColumn}-${rackCell}`;
+  };
+
+  const loadStorageLocations = async () => {
+    setLoadingStorageLocations(true);
+    try {
+      const response = await fetch('/api/storage-locations?limit=500');
+      if (!response.ok) throw new Error('No fue posible cargar las ubicaciones de rack');
+      const data = await response.json();
+      const nextLocations = Array.isArray(data.locations) ? data.locations : [];
+      setStorageLocations(nextLocations);
+
+      if (nextLocations.length > 0) {
+        const preferred = nextLocations.find((loc: any) => {
+          const currentLocationId = Number(selectedLot?.CurrentLocationID || 0);
+          return currentLocationId > 0 && (Number(loc.LocationID) === currentLocationId || Number(loc.StorageID) === currentLocationId);
+        }) || nextLocations[0];
+        setSelectedStorageLocation(preferred);
+        setDestinationLocationId(String(preferred.StorageID ?? preferred.LocationID ?? ''));
+        setRackCodeInput(getStorageLocationCode(preferred));
+      }
+    } catch (err) {
+      setStorageLocations([]);
+      setError(err instanceof Error ? err.message : 'Error cargando ubicaciones de rack');
+    } finally {
+      setLoadingStorageLocations(false);
+    }
+  };
+
   const handleScanPiece = (item: InboundOrderDetail) => {
     const detailId = item.PurchaseOrderDetailID;
     const current = scannedCounts[detailId] || 0;
@@ -498,19 +672,30 @@ export const Orders: React.FC = () => {
       return;
     }
 
-    setQuarantineQty(0);
-    // default selected status based on current progress
-    const totalExpected = inboundSummary?.totalExpected ?? 0;
-    const totalReceived = inboundSummary?.totalReceived ?? 0;
-    const scanned = totalScannedPieces;
-    const projected = totalReceived + scanned;
-    let defaultId = '';
-    if (projected <= 0) defaultId = String(20);
-    else if (projected < totalExpected) defaultId = String(8);
-    else defaultId = String(10);
-    setSelectedStatusId(defaultId);
     setShowQuarantineModal(true);
     setError('');
+    setRackCodeInput('');
+    void loadStorageLocations();
+    if (!sourceLocationId && selectedLot?.CurrentLocationID) {
+      setSourceLocationId(String(selectedLot.CurrentLocationID));
+    }
+  };
+
+  const handleRackCodeChange = (value: string) => {
+    setRackCodeInput(value.toUpperCase());
+
+    const normalized = value.trim().toUpperCase();
+    if (!normalized) {
+      setSelectedStorageLocation(null);
+      setDestinationLocationId('');
+      return;
+    }
+
+    const matchedLocation = storageLocations.find((loc: any) => getStorageLocationCode(loc) === normalized);
+    if (matchedLocation) {
+      setSelectedStorageLocation(matchedLocation);
+      setDestinationLocationId(String(matchedLocation.StorageID ?? matchedLocation.LocationID ?? ''));
+    }
   };
 
   const handleConfirmOrder = async () => {
@@ -532,26 +717,28 @@ export const Orders: React.FC = () => {
     }
 
     const totalScanned = scannedDetails.reduce((sum, item) => sum + item.scannedQty, 0);
-    if (quarantineQty < 0 || quarantineQty > totalScanned) {
-      setError('La cantidad para cuarentena no puede ser mayor al total escaneado.');
+
+    if (!selectedStorageLocation) {
+      setError('Debe seleccionar o escribir un rack válido que exista en el catálogo de ubicaciones.');
       return;
     }
 
     setError('');
     setConfirming(true);
     try {
-      const response = await fetch(`/api/orders/inbound/${selectedInboundOrder.PurchaseOrderID}/confirm`, {
+      const requestId = Number(selectedInboundOrder?.RequestID ?? selectedInboundOrder?.PurchaseOrderID ?? 0);
+      const response = await fetch(`/api/requests/inbound/${requestId}/confirm`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           scannedDetails,
-          quarantineQty,
           receivedBy: user?.id ? Number(user.id) : undefined,
-          orderStatusId: selectedStatusId ? Number(selectedStatusId) : undefined,
-          destinationLocationId: destinationLocationId ? Number(destinationLocationId) : undefined,
-          sourceLocationId: sourceLocationId ? Number(sourceLocationId) : undefined,
-          requestUserId: user?.id ? Number(user.id) : undefined,
+          storageId: selectedStorageLocation?.StorageID ? Number(selectedStorageLocation.StorageID) : undefined,
+          quantity: totalScanned,
           lotReference: selectedLot?.InternalLot || selectedLot?.ShortInternalLot || selectedLot?.ProviderLot || selectedLot?.LotReceiveID || selectedLot?.ReceiveID || null,
+          lotInventoryId: selectedLot?.LotInventoryID ?? selectedLot?.LotInventoryId ?? selectedLot?.id ?? null,
+          sourceLocationId: sourceLocationId ? Number(sourceLocationId) : (selectedLot?.CurrentLocationID ? Number(selectedLot.CurrentLocationID) : undefined),
+          requestUserId: user?.id ? Number(user.id) : undefined,
           comments: `Recepción confirmada desde ${selectedInboundOrder?.PONumber || 'PO'}`,
         }),
       });
@@ -695,7 +882,7 @@ export const Orders: React.FC = () => {
 
   if (!isOutbound && inboundView !== 'detail' && lotMode) {
     return (
-      <Layout title="Historial y escaneo">
+      <Layout title="Entradas">
         <div className="space-y-6">
           {error && (
             <div className="rounded-2xl border border-red-200 bg-red-50 dark:border-red-900/60 dark:bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-600 dark:text-red-300">
@@ -726,59 +913,31 @@ export const Orders: React.FC = () => {
           </div>
 
           <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-            <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Lotes disponibles</p>
-                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Toca uno para abrir su orden de recepción</p>
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Órdenes de entrada</p>
+                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Filtra por aprobadas o pendientes</p>
               </div>
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-300">
-                {filteredAvailableLots.length}
-              </span>
+              <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/80">
+                <button
+                  type="button"
+                  onClick={() => setInboundTab('approved')}
+                  className={`rounded-2xl px-4 py-2 text-sm font-black uppercase tracking-widest transition ${inboundTab === 'approved' ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900' : 'text-slate-600 dark:text-slate-300'}`}
+                >
+                  Aprobadas
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInboundTab('pending')}
+                  className={`rounded-2xl px-4 py-2 text-sm font-black uppercase tracking-widest transition ${inboundTab === 'pending' ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900' : 'text-slate-600 dark:text-slate-300'}`}
+                >
+                  Pendientes
+                </button>
+              </div>
             </div>
 
-            <div className="mt-4 space-y-3">
-              {availableLotsLoading ? (
-                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
-                  Cargando lotes...
-                </div>
-              ) : filteredAvailableLots.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
-                  No hay lotes disponibles para mostrar.
-                </div>
-              ) : filteredAvailableLots.map((lot: any) => {
-                const lotName = lot.InternalLot || lot.ShortInternalLot || lot.ProviderLot || `Lote ${lot.ReceiveID || lot.LotReceiveID}`;
-                return (
-                  <button
-                    key={`${lot.ReceiveID || lot.LotReceiveID || lot.ProviderLot || lot.InternalLot}-${lot.PurchaseOrderID || lot.PONumber || 'lot'}`}
-                    type="button"
-                    onClick={() => void handleSelectLot(lot)}
-                    className="w-full rounded-2xl border border-slate-100 bg-slate-50/70 p-3 text-left transition-all hover:border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-700/40 dark:hover:border-slate-500"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">{lot.PONumber || 'Sin PO'}</p>
-                        <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{lotName}</p>
-                      </div>
-                    </div>
-                    <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                      <span>Cantidad: {lot.Quantity ?? 0}</span>
-                      <span>Proveedor: {lot.ProviderLot || 'Sin referencia'}</span>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-            <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
-              <div>
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Órdenes pendientes por recibir</p>
-                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Toca una para abrir sus detalles</p>
-              </div>
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-300">
-                {orders.filter((order) => getInboundOrderStatus(order) === 'pending').length}
-              </span>
+            <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-black uppercase tracking-widest text-slate-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300">
+                <span>{inboundTab === 'approved' ? 'Historial de transferencias' : 'Órdenes pendientes'}</span>
             </div>
 
             <div className="mt-4 space-y-3">
@@ -786,32 +945,54 @@ export const Orders: React.FC = () => {
                 <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
                   Cargando órdenes...
                 </div>
-              ) : orders.filter((order) => getInboundOrderStatus(order) === 'pending').length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
-                  No hay órdenes pendientes para mostrar.
-                </div>
-              ) : orders.filter((order) => getInboundOrderStatus(order) === 'pending').map((order) => (
-                <button
-                  key={order.PurchaseOrderID}
-                  type="button"
-                  onClick={() => void handleSelectInboundOrder(order as InboundOrderSummary)}
-                  className="w-full rounded-2xl border border-slate-100 bg-slate-50/70 p-3 text-left transition-all hover:border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-700/40 dark:hover:border-slate-500"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">{order.PONumber || order.PurchaseOrderID}</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{order.ProviderName || `Proveedor ${order.ProviderID}`}</p>
-                    </div>
-                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:bg-slate-700 dark:text-slate-300">
-                      Pendiente
-                    </span>
+              ) : (
+                (inboundTab === 'approved' ? inboundApprovedOrders : inboundPendingOrders).length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
+                    No hay órdenes {inboundTab === 'approved' ? 'aprobadas' : 'pendientes'} para mostrar.
                   </div>
-                  <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                    <span>Recibido: {order.receivedQty ?? 0}</span>
-                    <span>Esperado: {order.orderedQty ?? 0}</span>
-                  </div>
-                </button>
-              ))}
+                ) : (
+                  <>
+                    {(inboundTab === 'approved' ? inboundApprovedOrders : inboundPendingOrders).map((order) => (
+                      <button
+                        key={order.PurchaseOrderID}
+                        type="button"
+                        onClick={() => void handleSelectInboundOrder(order as InboundOrderSummary)}
+                        className="w-full rounded-2xl border border-slate-100 bg-slate-50/70 p-3 text-left transition-all hover:border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-700/40 dark:hover:border-slate-500"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">{order.PONumber || order.PurchaseOrderID}</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{order.ProviderName || `Proveedor ${order.ProviderID}`}</p>
+                            {order.LotReceiveID ? (
+                              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Lote: {order.LotReceiveID}{order.LotInventoryID ? ` • Inventario ${order.LotInventoryID}` : ''}</p>
+                            ) : null}
+                            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Solo se pueden ver los detalles desde aquí, la recepción real se hace desde el escaneo del lote.</p>
+                          </div>
+                          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                            {inboundTab === 'approved' ? 'Aprobada' : 'Pendiente'}
+                          </span>
+                        </div>
+                        <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                          <span>Recibido: {order.receivedQty ?? 0}</span>
+                          <span>Esperado: {order.orderedQty ?? 0}</span>
+                        </div>
+                      </button>
+                    ))}
+
+                    {inboundHasMore && (
+                      <div className="mt-3 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => void loadInboundOrders(false)}
+                          className="px-6 py-2 rounded-xl bg-slate-900 text-white font-black"
+                        >
+                          Cargar más
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )
+              )}
             </div>
           </div>
         </div>
@@ -848,6 +1029,9 @@ export const Orders: React.FC = () => {
               <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Proveedor y Orden</p>
               <p className="mt-2 text-lg font-black text-slate-900 dark:text-slate-100">{selectedInboundOrder?.ProviderName || 'Proveedor'}</p>
               <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">PO: {selectedInboundOrder?.PONumber || 'Sin PO'}</p>
+              {selectedInboundOrder?.LotReceiveID ? (
+                <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Lote: {selectedInboundOrder.LotReceiveID}{selectedInboundOrder.LotInventoryID ? ` • Inventario ${selectedInboundOrder.LotInventoryID}` : ''}</p>
+              ) : null}
             </div>
 
             {inboundSummary && (
@@ -906,7 +1090,7 @@ export const Orders: React.FC = () => {
                           </div>
                         </div>
 
-                        {remaining > 0 && (
+                        {!isReadonlyInboundOrder && remaining > 0 && (
                           <button
                             type="button"
                             onClick={() => handleScanPiece(item)}
@@ -930,7 +1114,7 @@ export const Orders: React.FC = () => {
               )}
             </div>
 
-            {totalScannedPieces > 0 && (
+            {!isReadonlyInboundOrder && totalScannedPieces > 0 && (
               <button
                 type="button"
                 onClick={handleOpenQuarantineModal}
@@ -939,6 +1123,110 @@ export const Orders: React.FC = () => {
               >
                 {confirming ? 'Procesando...' : `Confirmar recepción (${totalScannedPieces} piezas)`}
               </button>
+            )}
+            {isReadonlyInboundOrder && (
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-300">
+                Esta orden está en estado {selectedInboundStatusId} y solo puedes revisar sus detalles. La interacción real se hace desde el escaneo del lote.
+              </div>
+            )}
+
+            {showQuarantineModal && (
+              <div className="fixed inset-0 z-[110] bg-slate-950/80 p-3 sm:p-6">
+                <div className="mx-auto max-w-3xl overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+                  <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-700 dark:bg-slate-800/70">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Confirmar recepción</p>
+                      <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Selecciona la ubicación de rack de destino</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowQuarantineModal(false)}
+                      className="rounded-full p-2 text-slate-600 transition hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-700"
+                    >
+                      <X size={20} />
+                    </button>
+                  </div>
+
+                  <div className="space-y-4 p-4 sm:p-6">
+                    {selectedLot ? (
+                      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm dark:border-slate-700 dark:bg-slate-800/50">
+                        <div className="font-black uppercase tracking-[0.2em] text-slate-400 dark:text-slate-300">Lote actual</div>
+                        <div className="mt-2 text-slate-900 dark:text-slate-100">
+                          {selectedLot.InternalLot || selectedLot.ProviderLot || selectedLot.ShortInternalLot || `#${selectedLot.LotReceiveID || selectedLot.ReceiveID || 'n/a'}`}
+                        </div>
+                        <div className="mt-1 text-slate-600 dark:text-slate-400">
+                          Ubicación actual: {selectedLot.CurrentLocationID ? String(selectedLot.CurrentLocationID) : 'Sin ubicación registrada'}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div>
+                      <label className="block">
+                        <span className="text-xs font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Rack de destino</span>
+                        <input
+                          type="text"
+                          value={rackCodeInput}
+                          onChange={(e) => handleRackCodeChange(e.target.value)}
+                          placeholder="Ej.: A-01-02"
+                          className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                        />
+                      </label>
+
+                      <div className="mt-3 flex items-center justify-between">
+                        <p className="text-sm font-black text-slate-900 dark:text-slate-100">Catálogo de ubicaciones disponibles</p>
+                        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{storageLocations.length} ubicaciones</span>
+                      </div>
+                      {loadingStorageLocations ? (
+                        <div className="py-8 text-center text-slate-500">Cargando ubicaciones...</div>
+                      ) : storageLocations.length === 0 ? (
+                        <div className="py-8 text-center text-slate-500">No hay ubicaciones de rack disponibles.</div>
+                      ) : (
+                        <div className="grid gap-2 max-h-80 overflow-y-auto pt-3">
+                          {storageLocations.map((loc) => {
+                            const locationCode = getStorageLocationCode(loc);
+                            const isSelected = selectedStorageLocation?.StorageID === loc.StorageID;
+                            return (
+                              <button
+                                key={loc.StorageID}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedStorageLocation(loc);
+                                  setDestinationLocationId(String(loc.StorageID ?? loc.LocationID ?? ''));
+                                  setRackCodeInput(locationCode);
+                                }}
+                                className={`w-full rounded-2xl border p-4 text-left transition ${isSelected ? 'border-blue-600 bg-blue-50 text-slate-900 dark:border-blue-400 dark:bg-blue-900/30 dark:text-white' : 'border-slate-200 bg-slate-50 text-slate-900 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-100'}`}
+                              >
+                                <div className="font-bold">{locationCode}</div>
+                                <div className="mt-1 text-sm opacity-80">
+                                  {loc.LocationName ? `${loc.LocationName} • ` : ''}Col {loc.RackColumn} - Cel {loc.RackCell}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
+                      <button
+                        type="button"
+                        onClick={handleConfirmOrder}
+                        disabled={confirming || !selectedStorageLocation}
+                        className="w-full rounded-2xl bg-slate-900 px-4 py-4 text-sm font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-60 dark:bg-slate-800 sm:w-auto"
+                      >
+                        {confirming ? 'Procesando...' : 'Confirmar recepción'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowQuarantineModal(false)}
+                        className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-4 text-sm font-black uppercase tracking-widest text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 sm:w-auto"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             )}
           </div>
         </div>
@@ -1068,6 +1356,16 @@ export const Orders: React.FC = () => {
               </motion.button>
             );
           })
+        )}
+        {isOutbound && outboundHasMore && (
+          <div className="mt-4 flex justify-center">
+            <button
+              onClick={() => { void loadOutboundOrders(false); }}
+              className="rounded-full bg-blue-600 text-white px-6 py-2 font-bold shadow-md"
+            >
+              Cargar más
+            </button>
+          </div>
         )}
       </div>
     </Layout>

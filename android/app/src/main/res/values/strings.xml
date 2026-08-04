@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">AXJC PDA</string>
+    <string name="title_activity_main">AXJC PDA</string>
+    <string name="package_name">com.axjc.pda</string>
+    <string name="custom_url_scheme">com.axjc.pda</string>
+</resources>

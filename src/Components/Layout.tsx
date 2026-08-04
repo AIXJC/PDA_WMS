@@ -12,7 +12,6 @@ import {
   LogOut,
   Wifi,
   WifiOff,
-  Battery,
   User
 } from 'lucide-react';
 import useAuthStore from '../store/useAuthStore';
@@ -53,17 +52,10 @@ export const Layout: React.FC<LayoutProps> = ({ children, title, showNav = true 
   return (
     <div className="flex flex-col h-screen bg-white text-slate-900 font-sans overflow-hidden dark:bg-slate-950 dark:text-slate-100">
       {/* Status Bar */}
-      <div className="bg-slate-900 text-slate-200 px-4 py-1 flex justify-between items-center text-[10px] font-medium uppercase tracking-wider border-b border-slate-800 shadow-none">
+      <div className="bg-slate-900 text-slate-200 px-4 py-1 flex items-center text-[10px] font-medium uppercase tracking-wider border-b border-slate-800 shadow-none">
         <div className="flex items-center gap-2">
           {isOffline ? <WifiOff size={12} className="text-rose-400" /> : <Wifi size={12} className="text-emerald-400" />}
           <span>{isOffline ? getTranslation(language, 'common.offline') : getTranslation(language, 'common.online')}</span>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1">
-            <Battery size={12} className="text-emerald-400" />
-            <span>85%</span>
-          </div>
-          <span>{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
       </div>
 

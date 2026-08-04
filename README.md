@@ -1,8 +1,27 @@
+# PDA_WMS
+
+## Recent Changes (2026-08-04)
+
+- Frontend: `src/Pages/Salidas.tsx` — refactored history rendering so the "Todos" view renders a consolidated list of requests and filtered status views show only the selected section. Improved readability and preserved pagination/load-more behavior.
+- Frontend: `src/Pages/Orders.tsx` — `loadInboundOrders()` now sends the `status` query parameter and `offset` to the backend when present, enabling consistent "pending" filtering from the dashboard link.
+- Backend: `server/index.js` — `/api/requests/inbound` now accepts a `status` parameter (e.g. `pending`) and maps it to the internal status id (41 for pending). Also added `offset` support for pagination and explicit filtering by location (incoming → storage).
+- General: minor fixes to pagination flow and inventory lookups used by the "Ver ubicaciones" widget.
+
+If you need a summary of the code changes or a deploy checklist, ask and I will add it here.
 # PDA System
 
 PDA System es una aplicación web móvil orientada a operaciones de almacén, inventario y logística para dispositivos PDA. Está diseñada para facilitar tareas como recepción de mercancía, inventario, escaneo, ajustes, transferencias, merma, solicitudes y consultas operativas desde una interfaz rápida y pensada para uso táctil.
 
 ## Descripción general
+
+## Recent Changes (2026-08-04)
+
+- Frontend: `src/Pages/Salidas.tsx` — refactored history rendering so the "Todos" view renders a consolidated list of requests and filtered status views show only the selected section. Improved readability and preserved pagination/load-more behavior.
+- Frontend: `src/Pages/Orders.tsx` — `loadInboundOrders()` now sends the `status` query parameter and `offset` to the backend when present, enabling consistent "pending" filtering from the dashboard link.
+- Backend: `server/index.js` — `/api/requests/inbound` now accepts a `status` parameter (e.g. `pending`) and maps it to the internal status id (41 for pending). Also added `offset` support for pagination and explicit filtering by location (incoming → storage).
+- General: minor fixes to pagination flow and inventory lookups used by the "Ver ubicaciones" widget.
+
+If you need a summary of the code changes or a deploy checklist, ask and I will add it here.
 
 El proyecto combina un frontend en React + TypeScript con un backend en Node.js + Express que expone APIs para consultar y, en algunos casos, registrar operaciones sobre una base de datos MariaDB. La interfaz está optimizada para pantallas pequeñas, con navegación tipo PDA y soporte para modo oscuro.
 

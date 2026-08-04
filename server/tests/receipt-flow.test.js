@@ -23,3 +23,19 @@ test('builds a transfer request payload from a receipt confirmation', () => {
   assert.equal(payload.LotReceiveID, 'BWL26072000014');
   assert.match(payload.Comments, /Recepción completada/);
 });
+
+test('includes lot inventory when provided so the request can be traced to a specific lot', () => {
+  const payload = buildInboundTransferRequestPayload({
+    partNumber: 'BL-320',
+    quantity: 4,
+    sourceLocationId: 3,
+    destinationLocationId: 5,
+    requestUserId: 7,
+    lotInventoryId: 88,
+    lotReference: 'BWL26072000014',
+    comments: 'Auto-created from inbound confirmation',
+  });
+
+  assert.equal(payload.LotInventoryID, 88);
+  assert.equal(payload.LotReceiveID, 'BWL26072000014');
+});

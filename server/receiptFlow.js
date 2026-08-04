@@ -5,6 +5,7 @@ export function buildInboundTransferRequestPayload({
   destinationLocationId,
   requestUserId,
   lotReference,
+  lotInventoryId,
   comments,
 }) {
   const parsedQty = Number(quantity);
@@ -13,6 +14,10 @@ export function buildInboundTransferRequestPayload({
     : undefined;
   const parsedDestinationLocationId = destinationLocationId !== undefined && destinationLocationId !== null && destinationLocationId !== ''
     ? Number(destinationLocationId)
+    : undefined;
+
+  const parsedLotInventoryId = lotInventoryId !== undefined && lotInventoryId !== null && lotInventoryId !== ''
+    ? Number(lotInventoryId)
     : undefined;
 
   return {
@@ -25,5 +30,6 @@ export function buildInboundTransferRequestPayload({
     DestinationLocationID: Number.isFinite(parsedDestinationLocationId) ? parsedDestinationLocationId : undefined,
     Comments: String(comments || '').trim() || undefined,
     LotReceiveID: lotReference !== undefined && lotReference !== null && lotReference !== '' ? String(lotReference) : undefined,
+    LotInventoryID: Number.isFinite(parsedLotInventoryId) ? parsedLotInventoryId : undefined,
   };
 }
