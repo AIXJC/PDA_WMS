@@ -18,6 +18,7 @@ import { Salidas } from './Pages/Salidas';
 import { Adjustments } from './Pages/Adjustments';
 import { HistoryPage } from './Pages/History';
 import { CyclicCount } from './Pages/CyclicCount';
+import { CyclicCountScan } from './Pages/CyclicCountScan';
 
 const ProtectedRoute = ({ children }: { children: React.ReactNode }) => {
   const { isAuthenticated, user } = useAuthStore();
@@ -71,7 +72,13 @@ function App() {
             <CyclicCount />
           </ProtectedRoute>
         } />
-        
+
+        <Route path="/inventory/cyclic/:id/count" element={
+          <ProtectedRoute>
+            <CyclicCountScan />
+          </ProtectedRoute>
+        } />
+
         <Route path="/orders/:type/detail/:detailId?" element={
           <ProtectedRoute>
             <Orders />

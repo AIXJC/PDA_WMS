@@ -170,3 +170,11 @@ export function storeMaterialInRack({ storageId, partNumber, quantity, batch }) 
     batch,
   });
 }
+
+export function recordPhysicalCount({ countId, batch, countedQuantity }) {
+  return callErpJson(process.env.ERP_RECORD_PHYSICAL_COUNT_URL, "POST", {
+    count_id: countId,
+    batch,
+    counted_quantity: countedQuantity,
+  });
+}

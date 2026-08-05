@@ -746,465 +746,165 @@ app.get("/api/scanner/:code", asyncRoute(async (req, res) => {
   });
 }));
 
+const CYCLIC_COUNT_STATUS_IDS = [46, 47, 48, 49]; // COMPLETED, IN_PROCESS, CANCELLED, REQUIRES_RECOUNT
+const CYCLIC_COUNT_STORAGE_LOCATION_ID = 5; // MES_LOT_INVENTORY.CurrentLocationID required to allow a physical count
+
+const CYCLIC_COUNT_SELECT_FIELDS = `
+  cc.CycleCountID,
+  cc.ERPCycleCountID,
+  cc.LocationID,
+  cc.StorageLocationID,
+  cc.StatusID,
+  cc.InventoryID,
+  cc.PartNumber,
+  cc.LocationCode,
+  cc.SystemQuantity,
+  cc.CountedQuantity,
+  cc.Difference,
+  cc.Result,
+  cc.AdjustmentStatus,
+  cc.ProgressPercent,
+  cc.AttemptNo,
+  cc.Comments,
+  cc.CreatedDate,
+  cc.UpdateDate,
+  s.StatusCode,
+  s.StatusDescription,
+  sl.RackName,
+  sl.RackColumn,
+  sl.RackCell,
+  pl.LocationName,
+  mmi.PartName
+`;
+
+const CYCLIC_COUNT_JOINS = `
+  FROM MES_CYCLE_COUNTING cc
+  LEFT JOIN MES_STATUS s ON s.StatusID = cc.StatusID
+  LEFT JOIN STORAGE_LOCATIONS sl ON sl.StorageID = cc.StorageLocationID
+  LEFT JOIN PLANT_LOCATIONS pl ON pl.LocationID = cc.LocationID
+  LEFT JOIN MES_MASTER_ITEMS mmi ON mmi.PartNumber = cc.PartNumber
+`;
+
 app.get("/api/cyclic-count", asyncRoute(async (req, res) => {
-  const limit = getLimit(req.query.limit, 100);
-  const offset = Number(req.query.offset || 0) || 0;
+  const requestedStatus = String(req.query.status || '')
+    .split(',')
+    .map((value) => Number(value.trim()))
+    .filter((value) => CYCLIC_COUNT_STATUS_IDS.includes(value));
+  const statusFilter = requestedStatus.length > 0 ? requestedStatus : CYCLIC_COUNT_STATUS_IDS;
+  const placeholders = statusFilter.map(() => '?').join(', ');
+
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = getLimit(req.query.limit, 20);
+  const offset = (page - 1) * limit;
+
+  const countRows = await query(
+    `SELECT COUNT(*) AS total FROM MES_CYCLE_COUNTING cc WHERE cc.StatusID IN (${placeholders})`,
+    statusFilter
+  );
+  const total = Number(countRows[0]?.total || 0);
+
   const rows = await query(`
-    SELECT
-      cc.CycleCountID,
-      cc.LocationID,
-      cc.StatusID,
-      cc.PackCount,
-      cc.InventoryID,
-      sl.RackName,
-      sl.RackColumn,
-      sl.RackCell,
-      s.StatusCode,
-      s.StatusDescription,
-      COUNT(mi.InventoryID) AS InventoryItemCount,
-      COALESCE(SUM(COALESCE(mi.Quantity, 0)), 0) AS CurrentQuantity,
-      MIN(mi.PartNumber) AS PartNumber,
-      MIN(mmi.PartName) AS PartName,
-      MIN(mmi.WorkArea) AS WorkArea
-    FROM MES_CYCLE_COUNTING cc
-    LEFT JOIN STORAGE_LOCATIONS sl ON sl.StorageID = cc.LocationID
-    LEFT JOIN MES_STATUS s ON s.StatusID = cc.StatusID
-    LEFT JOIN MES_INVENTORY mi ON mi.RackLocationID = cc.LocationID
-    LEFT JOIN MES_MASTER_ITEMS mmi ON mmi.PartNumber = mi.PartNumber
-    GROUP BY
-      cc.CycleCountID,
-      cc.LocationID,
-      cc.StatusID,
-      cc.PackCount,
-      cc.InventoryID,
-      sl.RackName,
-      sl.RackColumn,
-      sl.RackCell,
-      s.StatusCode,
-      s.StatusDescription
-    ORDER BY cc.CycleCountID DESC
+    SELECT ${CYCLIC_COUNT_SELECT_FIELDS}
+    ${CYCLIC_COUNT_JOINS}
+    WHERE cc.StatusID IN (${placeholders})
+    ORDER BY cc.UpdateDate DESC, cc.CycleCountID DESC
     LIMIT ?
     OFFSET ?
-  `, [limit, offset]);
+  `, [...statusFilter, limit, offset]);
 
   res.json({
-    count: rows.length,
     cycles: rows,
-  });
-}));
-
-app.get("/api/cyclic-count/:id/items", asyncRoute(async (req, res) => {
-  const cycleId = Number(req.params.id);
-
-  const [cycleRows] = await pool.query(
-    'SELECT CycleCountID, LocationID, StatusID, InventoryID FROM MES_CYCLE_COUNTING WHERE CycleCountID = ? LIMIT 1',
-    [cycleId]
-  );
-
-  if (!cycleRows[0]) {
-    return res.status(404).json({ message: 'Conteo cíclico no encontrado' });
-  }
-
-  const cycle = cycleRows[0];
-  const [items] = await pool.query(`
-    SELECT
-      mi.InventoryID,
-      mi.PartNumber,
-      mmi.PartName,
-      mmi.WorkArea,
-      mmi.PartType,
-      mmi.UnitType,
-      mi.Quantity AS CurrentQuantity,
-      NULL AS LotInventoryID,
-      sl.RackName,
-      sl.RackColumn,
-      sl.RackCell,
-      pl.LocationName,
-      NULL AS LotReceiveID,
-      NULL AS CurrentInternalLot,
-      NULL AS LotCurrentQuantity
-    FROM MES_INVENTORY mi
-    LEFT JOIN MES_MASTER_ITEMS mmi ON mmi.PartNumber = mi.PartNumber
-    LEFT JOIN STORAGE_LOCATIONS sl ON sl.StorageID = mi.RackLocationID
-    LEFT JOIN PLANT_LOCATIONS pl ON pl.LocationID = sl.LocationID
-    WHERE mi.RackLocationID = ?
-    ORDER BY mi.PartNumber
-  `, [cycle.LocationID]);
-
-  res.json({
-    cycle: {
-      CycleCountID: cycle.CycleCountID,
-      LocationID: cycle.LocationID,
-      StatusID: cycle.StatusID,
-      InventoryID: cycle.InventoryID,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
     },
-    items,
   });
 }));
 
-app.post("/api/cyclic-count/:id/cancel", asyncRoute(async (req, res) => {
+app.get("/api/cyclic-count/:id", asyncRoute(async (req, res) => {
   const cycleId = Number(req.params.id);
-
-  if (!Number.isFinite(cycleId) || cycleId <= 0) {
+  if (!Number.isInteger(cycleId) || cycleId <= 0) {
     return res.status(400).json({ message: 'CycleCountID inválido' });
   }
 
-  const [statusRows] = await pool.query(
-    'SELECT StatusID FROM MES_STATUS WHERE StatusCode = ? LIMIT 1',
-    ['PENDING']
-  );
-
-  const pendingStatusId = Number(statusRows[0]?.StatusID ?? 13);
-
-  await pool.query(
-    'UPDATE MES_CYCLE_COUNTING SET StatusID = ? WHERE CycleCountID = ?',
-    [pendingStatusId, cycleId]
-  );
-
-  res.json({ ok: true, status: 'pending', statusId: pendingStatusId });
-}));
-
-app.post("/api/cyclic-count/:id/complete", asyncRoute(async (req, res) => {
-  const cycleId = Number(req.params.id);
-  const { scannedItems } = req.body || {};
-
-  if (!Array.isArray(scannedItems)) {
-    return res.status(400).json({ message: 'scannedItems debe ser un array' });
-  }
-
-  const [cycleRows] = await pool.query(
-    'SELECT CycleCountID, InventoryID, StatusID, LocationID FROM MES_CYCLE_COUNTING WHERE CycleCountID = ? LIMIT 1',
-    [cycleId]
-  );
-
-  if (!cycleRows[0]) {
-    return res.status(404).json({ message: 'Conteo cíclico no encontrado' });
-  }
-
-  const cycle = cycleRows[0];
-  const totalScanned = scannedItems.length;
-  const statusCompletedId = 46;
-  const adjustmentRequestTypeId = getInventoryRequestTypeIdByKey('ajuste') ?? getInventoryRequestTypeIdByKey('adjustment') ?? 7;
-
-  const [storageRows] = await pool.query(
-    'SELECT LocationID FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1',
-    [cycle.LocationID]
-  );
-  const locationIdForMovement = Number(storageRows[0]?.LocationID || 0);
-
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    await connection.query(
-      'UPDATE MES_CYCLE_COUNTING SET StatusID = ?, PackCount = ? WHERE CycleCountID = ?',
-      [statusCompletedId, totalScanned, cycleId]
-    );
-
-    const adjustmentRequests = [];
-    for (const item of scannedItems) {
-      const inventoryId = Number(item.inventoryId);
-      const countedQty = Number(item.countedQty) || 0;
-      const lotInventoryId = item.lotInventoryId ? Number(item.lotInventoryId) : null;
-
-      if (Number.isNaN(inventoryId) || inventoryId <= 0) continue;
-
-      const [inventoryRows] = await connection.query(
-        'SELECT InventoryID, PartNumber, Quantity FROM MES_INVENTORY WHERE InventoryID = ? LIMIT 1',
-        [inventoryId]
-      );
-      const inventoryRow = inventoryRows[0];
-      if (!inventoryRow) continue;
-
-      const previousQty = Number(inventoryRow.Quantity || 0);
-      const adjustmentQty = countedQty - previousQty;
-
-      await connection.query(
-        'UPDATE MES_INVENTORY SET Quantity = ?, LastUpdate = NOW() WHERE InventoryID = ?',
-        [countedQty, inventoryId]
-      );
-
-      if (lotInventoryId && Number.isInteger(lotInventoryId) && lotInventoryId > 0) {
-        await connection.query(
-          'UPDATE MES_LOT_INVENTORY SET CurrentQuantity = ? WHERE LotInventoryID = ?',
-          [countedQty, lotInventoryId]
-        );
-      }
-
-      if (adjustmentQty !== 0) {
-        const [requestInsertResult] = await connection.query(`
-          INSERT INTO INVENTORY_REQUESTS (
-            RequestStatusID,
-            RequestTypeID,
-            PartNumber,
-            Quantity,
-            RegUserID,
-            ConfirmUserID,
-            SourceLocationID,
-            DestinationLocationID,
-            LotInventoryID,
-            SubmitDate,
-            Comments
-          ) VALUES (40, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)
-        `, [
-          adjustmentRequestTypeId,
-          String(inventoryRow.PartNumber || ''),
-          Math.abs(adjustmentQty),
-          1,
-          1,
-          locationIdForMovement,
-          locationIdForMovement,
-          lotInventoryId || null,
-          `CICLE:${cycleId}:DELTA:${adjustmentQty}`,
-        ]);
-
-        const requestId = requestInsertResult.insertId;
-        adjustmentRequests.push(requestId);
-
-        await connection.query(`
-          INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
-            RequestID,
-            PartNumber,
-            StorageID,
-            Quantity,
-            MovementTypeID,
-            SourceLocationID,
-            DestinationLocationID,
-            RegUserID,
-            ConfirmUserID,
-            Comments,
-            OriginalInternalLot,
-            NewInternalLot
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-          requestId,
-          String(inventoryRow.PartNumber || ''),
-          Number(cycle.LocationID || 0),
-          adjustmentQty,
-          adjustmentRequestTypeId,
-          locationIdForMovement,
-          locationIdForMovement,
-          1,
-          1,
-          `Movimiento de ajuste en ciclo cíclico ${cycleId}`,
-          lotInventoryId ? String(lotInventoryId) : null,
-          lotInventoryId ? String(lotInventoryId) : null,
-        ]);
-      }
-    }
-
-    await connection.commit();
-
-    res.json({
-      ok: true,
-      cycleCountID: cycleId,
-      itemsScanned: totalScanned,
-      adjustmentRequests,
-      message: 'Conteo completado correctamente',
-    });
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
-}));
-
-app.get("/api/cyclic-count/adjustments", asyncRoute(async (req, res) => {
   const rows = await query(`
-    SELECT
-      req.RequestID,
-      req.RequestStatusID,
-      req.RequestTypeID,
-      req.PartNumber,
-      req.Quantity,
-      req.LotInventoryID,
-      req.RequestName,
-      li.InventoryID AS InventoryID,
-      li.CurrentQuantity AS LotCurrentQuantity,
-      li.CurrentLocationID AS LotCurrentLocationID,
-      item.PartName,
-      status.StatusCode,
-      status.StatusDescription
-    FROM INVENTORY_REQUESTS req
-    LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
-    LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
-    LEFT JOIN MES_STATUS status ON status.StatusID = req.RequestStatusID
-    WHERE LOWER(COALESCE(req.RequestName, '')) LIKE '%cicle:%'
-      OR LOWER(COALESCE(req.RequestName, '')) LIKE '%ciclo%'
-      OR LOWER(COALESCE(req.RequestName, '')) LIKE '%ajuste%'
-    ORDER BY req.RequestID DESC
-  `);
-
-  res.json({ count: rows.length, adjustments: rows });
-}));
-
-app.post("/api/cyclic-count/adjustments/:id/approve", asyncRoute(async (req, res) => {
-  const requestId = Number(req.params.id);
-  if (!Number.isInteger(requestId) || requestId <= 0) {
-    return res.status(400).json({ message: 'ID de ajuste inválido' });
-  }
-
-  const [requestRows] = await pool.query('SELECT * FROM INVENTORY_REQUESTS WHERE RequestID = ? LIMIT 1', [requestId]);
-  const requestRow = requestRows[0];
-  if (!requestRow) return res.status(404).json({ message: 'Solicitud de ajuste no encontrada' });
-
-  const commentText = String(requestRow.RequestName || '');
-  const deltaMatch = commentText.match(/DELTA:([+-]?\d+(?:\.\d+)?)/);
-  const delta = deltaMatch ? Number(deltaMatch[1]) : 0;
-  const lotInventoryId = requestRow.LotInventoryID ? Number(requestRow.LotInventoryID) : null;
-
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    let inventoryId = null;
-    if (lotInventoryId && Number.isInteger(lotInventoryId) && lotInventoryId > 0) {
-      const [lotRows] = await connection.query(
-        'SELECT InventoryID, CurrentQuantity FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1',
-        [lotInventoryId]
-      );
-      const lotRow = lotRows[0];
-      if (lotRow?.InventoryID) {
-        inventoryId = Number(lotRow.InventoryID);
-      }
-    }
-
-    if (inventoryId) {
-      const [inventoryRows] = await connection.query(
-        'SELECT InventoryID, Quantity FROM MES_INVENTORY WHERE InventoryID = ? LIMIT 1',
-        [inventoryId]
-      );
-      const inventoryRow = inventoryRows[0];
-      if (inventoryRow) {
-        const nextQty = Number(inventoryRow.Quantity || 0) + delta;
-        await connection.query(
-          'UPDATE MES_INVENTORY SET Quantity = ?, LastUpdate = NOW() WHERE InventoryID = ?',
-          [nextQty, inventoryId]
-        );
-      }
-    }
-
-    if (lotInventoryId && Number.isInteger(lotInventoryId) && lotInventoryId > 0) {
-      const [lotRows] = await connection.query(
-        'SELECT CurrentQuantity FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1',
-        [lotInventoryId]
-      );
-      const lotRow = lotRows[0];
-      if (lotRow) {
-        const nextLotQty = Number(lotRow.CurrentQuantity || 0) + delta;
-        await connection.query(
-          'UPDATE MES_LOT_INVENTORY SET CurrentQuantity = ? WHERE LotInventoryID = ?',
-          [nextLotQty, lotInventoryId]
-        );
-      }
-    }
-
-    await connection.query(
-      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, RequestName = ? WHERE RequestID = ?',
-      [`${commentText} | APROBADO`, requestId]
-    );
-
-    await connection.commit();
-    res.json({ ok: true, requestId, appliedDelta: delta });
-  } catch (error) {
-    await connection.rollback().catch(() => {});
-    throw error;
-  } finally {
-    connection.release();
-  }
-}));
-
-app.post("/api/cyclic-count/adjustments/:id/reject", asyncRoute(async (req, res) => {
-  const requestId = Number(req.params.id);
-  if (!Number.isInteger(requestId) || requestId <= 0) {
-    return res.status(400).json({ message: 'ID de ajuste inválido' });
-  }
-
-  const [requestRows] = await pool.query('SELECT RequestName FROM INVENTORY_REQUESTS WHERE RequestID = ? LIMIT 1', [requestId]);
-  const requestRow = requestRows[0];
-  if (!requestRow) return res.status(404).json({ message: 'Solicitud de ajuste no encontrada' });
-
-  await pool.query(
-    'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 40, RequestName = ? WHERE RequestID = ?',
-    [`${String(requestRow.RequestName || '')} | DEVUELTO`, requestId]
-  );
-
-  res.json({ ok: true, requestId, status: 'returned' });
-}));
-
-app.post("/api/cyclic-count", asyncRoute(async (req, res) => {
-  const { locationId } = req.body;
-
-  if (!locationId) {
-    return res.status(400).json({ message: 'locationId es requerido' });
-  }
-
-  const locationIdNum = Number(locationId);
-
-  const [locations] = await pool.query(
-    'SELECT StorageID, RackName, RackColumn, RackCell, LocationID FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1',
-    [locationIdNum]
-  );
-
-  if (!locations[0]) {
-    return res.status(404).json({ message: 'Ubicación no encontrada' });
-  }
-
-  const statusInProcessId = 47;
-  const [inventoryRows] = await pool.query(
-    'SELECT InventoryID FROM MES_INVENTORY WHERE RackLocationID = ? ORDER BY InventoryID LIMIT 1',
-    [locationIdNum]
-  );
-  const initialInventoryId = inventoryRows[0]?.InventoryID ?? 1;
-
-  const [packRows] = await pool.query(
-    'SELECT PackID FROM MES_PACK_PART ORDER BY PackID LIMIT 1'
-  );
-  const packId = packRows[0]?.PackID ?? 1;
-
-  const [result] = await pool.query(
-    'INSERT INTO MES_CYCLE_COUNTING (LocationID, StatusID, PackCount, InventoryID) VALUES (?, ?, ?, ?)',
-    [locationIdNum, statusInProcessId, packId, initialInventoryId]
-  );
-
-  if (!result.insertId) {
-    return res.status(500).json({ message: 'Error creando ciclo de conteo' });
-  }
-
-  const cycleId = result.insertId;
-
-  const [cycle] = await pool.query(`
-    SELECT
-      cc.CycleCountID,
-      cc.LocationID,
-      cc.StatusID,
-      cc.PackCount,
-      cc.InventoryID,
-      sl.RackName,
-      sl.RackColumn,
-      sl.RackCell,
-      s.StatusCode,
-      s.StatusDescription,
-      COUNT(mi.InventoryID) AS InventoryItemCount,
-      COALESCE(SUM(COALESCE(mi.Quantity, 0)), 0) AS CurrentQuantity
-    FROM MES_CYCLE_COUNTING cc
-    LEFT JOIN STORAGE_LOCATIONS sl ON sl.StorageID = cc.LocationID
-    LEFT JOIN MES_STATUS s ON s.StatusID = cc.StatusID
-    LEFT JOIN MES_INVENTORY mi ON mi.RackLocationID = cc.LocationID
+    SELECT ${CYCLIC_COUNT_SELECT_FIELDS}
+    ${CYCLIC_COUNT_JOINS}
     WHERE cc.CycleCountID = ?
-    GROUP BY cc.CycleCountID, cc.LocationID, cc.StatusID, cc.PackCount, cc.InventoryID, sl.RackName, sl.RackColumn, sl.RackCell, s.StatusCode, s.StatusDescription
     LIMIT 1
   `, [cycleId]);
 
-  if (!cycle[0]) {
-    return res.status(500).json({ message: 'Error recuperando ciclo creado' });
+  if (!rows[0]) {
+    return res.status(404).json({ message: 'Conteo cíclico no encontrado' });
   }
 
-  res.status(201).json({
+  res.json({ cycle: rows[0] });
+}));
+
+app.post("/api/cyclic-count/:id/scan", asyncRoute(async (req, res) => {
+  const cycleId = Number(req.params.id);
+  const batch = String(req.body?.batch || '').trim();
+
+  if (!Number.isInteger(cycleId) || cycleId <= 0) {
+    return res.status(400).json({ message: 'CycleCountID inválido' });
+  }
+  if (!batch) {
+    return res.status(400).json({ message: 'El código de lote escaneado es requerido' });
+  }
+
+  const [cycleRows] = await pool.query(
+    'SELECT CycleCountID, ERPCycleCountID FROM MES_CYCLE_COUNTING WHERE CycleCountID = ? LIMIT 1',
+    [cycleId]
+  );
+  const cycle = cycleRows[0];
+  if (!cycle) {
+    return res.status(404).json({ message: 'Conteo cíclico no encontrado' });
+  }
+  if (!cycle.ERPCycleCountID) {
+    return res.status(409).json({ message: 'Este conteo no tiene un ID de ERP asociado (ERPCycleCountID)' });
+  }
+
+  const [lotRows] = await pool.query(
+    'SELECT LotInventoryID, CurrentInternalLot, CurrentLocationID, CurrentQuantity FROM MES_LOT_INVENTORY WHERE CurrentInternalLot = ? LIMIT 1',
+    [batch]
+  );
+  const lot = lotRows[0];
+  if (!lot) {
+    return res.status(404).json({ message: `Lote ${batch} no encontrado`, batch });
+  }
+
+  if (Number(lot.CurrentLocationID) !== CYCLIC_COUNT_STORAGE_LOCATION_ID) {
+    return res.status(409).json({
+      message: `No se puede contar el lote ${batch}: no se encuentra en la ubicación de conteo cíclico`,
+      warning: true,
+      batch,
+    });
+  }
+
+  const countedQuantity = Number(lot.CurrentQuantity || 0);
+
+  const erpResult = await erpClient.recordPhysicalCount({
+    countId: cycle.ERPCycleCountID,
+    batch,
+    countedQuantity,
+  });
+
+  if (!erpResult.ok) {
+    return res.status(erpResult.status && erpResult.status >= 400 ? erpResult.status : 502).json({
+      message: erpResult.message || 'Error al registrar el conteo en el ERP',
+      batch,
+      countedQuantity,
+    });
+  }
+
+  res.json({
     ok: true,
-    cycle: cycle[0],
-    message: 'Ciclo de conteo creado exitosamente',
+    batch,
+    countId: cycle.ERPCycleCountID,
+    countedQuantity,
+    message: erpResult.message || 'Conteo registrado correctamente',
   });
 }));
 
