@@ -64,10 +64,6 @@ async function callErpJson(url, method, body) {
   }
 }
 
-// Endpoints de mes_integration.api.warehouse_map.storage_locations.* : cuerpo
-// application/x-www-form-urlencoded, y SIEMPRE responden HTTP 200 (incluso en
-// error) — el resultado real viene envuelto en el campo "message" de Frappe:
-// { "message": { "status": "success"|"error", "action", "message", "data" } }
 async function callErpForm(url, method, fields) {
   if (!url) {
     return { ok: false, status: 0, data: null, message: "Endpoint del ERP no configurado (revisa server/.env)." };
@@ -124,18 +120,46 @@ async function callErpForm(url, method, fields) {
   }
 }
 
+export function isMaterialConsumptionType(requestTypeId) {
+  return Number(requestTypeId) === 3 || Number(requestTypeId) === 12;
+}
+
 export function createStockEntry(requestId) {
   return callErpJson(process.env.ERP_CREATE_STOCK_ENTRY_URL, "POST", { request_id: requestId });
+}
+
+export function createMaterialConsumption(requestId) {
+  return callErpJson(process.env.ERP_CREATE_MATERIAL_CONSUMPTION_URL, "POST", { request_id: requestId });
 }
 
 export function updateStockEntry(requestId) {
   return callErpJson(process.env.ERP_UPDATE_STOCK_ENTRY_URL, "PUT", { request_id: requestId });
 }
 
-export function submitStockEntry({ requestId, quantity, batchNo }) {
-  const body = { request_id: requestId, quantity };
-  if (batchNo) body.batch_no = batchNo;
-  return callErpJson(process.env.ERP_SUBMIT_STOCK_ENTRY_URL, "PUT", body);
+export function submitStockEntry({ requestId, qty, batchNo }) {
+  return callErpJson(process.env.ERP_SUBMIT_STOCK_ENTRY_URL, "PUT", {
+    request_id: requestId,
+    items: [{ qty, batch_no: batchNo }],
+  });
+}
+
+export function submitMaterialConsumption({ requestId, qty, batchNo }) {
+  return callErpJson(process.env.ERP_SUBMIT_MATERIAL_CONSUMPTION_URL, "PUT", {
+    request_id: requestId,
+    items: [{ qty, batch_no: batchNo }],
+  });
+}
+
+export function createEntryForRequestType(requestId, requestTypeId) {
+  return isMaterialConsumptionType(requestTypeId)
+    ? createMaterialConsumption(requestId)
+    : createStockEntry(requestId);
+}
+
+export function submitEntryForRequestType({ requestId, requestTypeId, qty, batchNo }) {
+  return isMaterialConsumptionType(requestTypeId)
+    ? submitMaterialConsumption({ requestId, qty, batchNo })
+    : submitStockEntry({ requestId, qty, batchNo });
 }
 
 export function storeMaterialInRack({ storageId, partNumber, quantity, batch }) {

@@ -8,7 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import * as erpClient from "./erpClient.js";
 import { buildInboundTransferRequestPayload } from './receiptFlow.js';
-import { shouldApplyInventoryUpdate, upsertInventoryFromLot } from './inventoryFlow.js';
+import { shouldApplyInventoryUpdate, upsertInventoryFromLot, reverseSubmittedMovement } from './inventoryFlow.js';
 
 dotenv.config({ path: "server/.env" });
 dotenv.config();
@@ -32,7 +32,8 @@ const configKeys = new Set([
   'API_HOST',
   'API_PORT',
   'API_BASE_URL',
-  'CONFIG_PASSWORD'
+  'CONFIG_PASSWORD',
+  'ERP_API_TOKEN',
 ]);
 
 const parseEnvFile = () => {
@@ -84,14 +85,17 @@ app.use("/api", (req, res, next) => {
   if (req.method === 'POST' && req.path === '/scrap') return next();
   if (req.method === 'POST' && req.path === '/transfers') return next();
   if (req.method === 'POST' && req.path === '/requests') return next();
+  // if (req.method === 'POST' && /^\/requests\/inbound\/\d+\/confirm$/.test(req.path)) return next();
   if (req.method === 'PUT' && /^\/requests\/\d+$/.test(req.path)) return next();
   if (req.method === 'POST' && /^\/requests\/\d+\/execute-transfer$/.test(req.path)) return next();
+  if (req.method === 'POST' && req.path === '/erp/create-stock-entry') return next();
+  if (req.method === 'PUT' && req.path === '/erp/submit-stock-entry') return next();
 
-  if (req.method !== "GET" && req.method !== "OPTIONS") {
-    return res.status(405).json({
-      message: "Backend en modo solo lectura. No se permiten escrituras en MariaDB.",
-    });
-  }
+  // if (req.method !== "GET" && req.method !== "OPTIONS") {
+  //   return res.status(405).json({
+  //     message: "Backend en modo solo lectura. No se permiten escrituras en MariaDB.",
+  //   });
+  // }
 
   next();
 });
@@ -417,6 +421,7 @@ app.get("/api/modules", (_req, res) => {
       "POST /api/requests",
       "PUT /api/requests/:id",
       "POST /api/requests/:id/execute-transfer",
+      "POST /api/erp/create-stock-entry",
     ],
     modules: {
       dashboard: ["/api/dashboard"],
@@ -2592,7 +2597,7 @@ app.get("/api/scrap/requests", asyncRoute(async (req, res) => {
     LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
     LEFT JOIN PLANT_LOCATIONS source ON source.LocationID = req.SourceLocationID
     LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
-    WHERE req.RequestStatusID IN (40, 42)
+    WHERE req.RequestStatusID IN (40, 41)
       AND (
         req.RequestTypeID = 6
         OR req.RequestTypeID = 2
@@ -2616,22 +2621,39 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
   const { quantity, scrapType, comments, regUserId } = req.body || {};
 
   if (!Number.isInteger(requestId) || requestId <= 0) {
-    return res.status(400).json({ message: 'RequestID inválido.' });
+    return res.status(400).json({
+      message: 'RequestID inválido.'
+    });
   }
 
   const parsedQty = Number(quantity);
+
   if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
-    return res.status(400).json({ message: 'La cantidad debe ser mayor a cero.' });
+    return res.status(400).json({
+      message: 'La cantidad debe ser mayor a cero.'
+    });
   }
 
-  const normalizedComments = comments ? String(comments).trim() : null;
-  const normalizedScrapType = scrapType ? String(scrapType).trim() : null;
-  const normalizedUserId = regUserId ? Number(regUserId) : null;
+  const normalizedComments = comments
+    ? String(comments).trim()
+    : null;
+
+  const normalizedScrapType = scrapType
+    ? String(scrapType).trim()
+    : null;
+
+  const normalizedUserId = regUserId
+    ? Number(regUserId)
+    : null;
+
   if (!normalizedScrapType) {
-    return res.status(400).json({ message: 'Debe indicar un tipo de Scrap.' });
+    return res.status(400).json({
+      message: 'Debe indicar un tipo de Scrap.'
+    });
   }
 
   const connection = await pool.getConnection();
+
   try {
     await connection.beginTransaction();
 
@@ -2643,83 +2665,169 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
         req.PartNumber,
         req.Quantity AS RequestQuantity,
         req.LotInventoryID,
+        req.SourceLocationID,
+        req.DestinationLocationID,
         li.CurrentQuantity AS LotCurrentQuantity,
         li.CurrentLocationID AS LotLocationID,
         li.CurrentInternalLot
       FROM INVENTORY_REQUESTS req
-      LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
+      LEFT JOIN MES_LOT_INVENTORY li
+        ON li.LotInventoryID = req.LotInventoryID
       WHERE req.RequestID = ?
       LIMIT 1
     `, [requestId]);
 
     const requestRow = requestRows[0];
+
     if (!requestRow) {
       await connection.rollback();
-      return res.status(404).json({ message: 'Solicitud no encontrada.' });
+
+      return res.status(404).json({
+        message: 'Solicitud no encontrada.'
+      });
     }
 
     const isScrapRequest = Number(requestRow.RequestTypeID) === 6;
-    const isTransferLikeRequest = [2, 3].includes(Number(requestRow.RequestTypeID));
+    const isTransferLikeRequest = [2, 3].includes(
+      Number(requestRow.RequestTypeID)
+    );
+
     if (!isScrapRequest && !isTransferLikeRequest) {
       await connection.rollback();
-      return res.status(400).json({ message: 'Sólo se pueden procesar solicitudes de Scrap o transferencias hacia cuarentena/purgue.' });
+
+      return res.status(400).json({
+        message: 'Sólo se pueden procesar solicitudes de Scrap o transferencias hacia cuarentena/purgue.'
+      });
     }
+
     if (![41, 42].includes(Number(requestRow.RequestStatusID))) {
       await connection.rollback();
-      return res.status(400).json({ message: 'Sólo se pueden procesar solicitudes aprobadas o ejecutadas para Scrap.' });
+
+      return res.status(400).json({
+        message: 'Sólo se pueden procesar solicitudes aprobadas o ejecutadas para Scrap.'
+      });
     }
 
     if (!requestRow.LotInventoryID) {
       await connection.rollback();
-      return res.status(400).json({ message: 'La solicitud no tiene un lote de inventario asociado.' });
+
+      return res.status(400).json({
+        message: 'La solicitud no tiene un lote de inventario asociado.'
+      });
     }
 
     const [lotRows] = await connection.query(
-      'SELECT LotInventoryID, CurrentQuantity, CurrentLocationID FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
+      `
+        SELECT
+          LotInventoryID,
+          CurrentQuantity,
+          CurrentLocationID
+        FROM MES_LOT_INVENTORY
+        WHERE LotInventoryID = ?
+        FOR UPDATE
+      `,
       [requestRow.LotInventoryID]
     );
+
     const lotRow = lotRows[0];
+
     if (!lotRow) {
       await connection.rollback();
-      return res.status(404).json({ message: 'El lote de inventario asociado no fue encontrado.' });
+
+      return res.status(404).json({
+        message: 'El lote de inventario asociado no fue encontrado.'
+      });
     }
 
-    const destinationLocationId = requestRow.DestinationLocationID ? Number(requestRow.DestinationLocationID) : null;
-    const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
+    const destinationLocationId =
+      requestRow.DestinationLocationID != null
+        ? Number(requestRow.DestinationLocationID)
+        : null;
+
+    const sourceLocationId =
+      requestRow.SourceLocationID != null
+        ? Number(requestRow.SourceLocationID)
+        : null;
+
+    if (
+      destinationLocationId === null &&
+      sourceLocationId === null
+    ) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        message: 'La solicitud no tiene una ubicación de origen ni de destino.'
+      });
+    }
 
     if (destinationLocationId !== null) {
-      if (lotRow.CurrentLocationID == null || Number(lotRow.CurrentLocationID) !== destinationLocationId) {
+      if (
+        lotRow.CurrentLocationID == null ||
+        Number(lotRow.CurrentLocationID) !== destinationLocationId
+      ) {
         await connection.rollback();
-        return res.status(409).json({ message: 'El lote debe estar en la ubicación de cuarentena/purgue indicada en la solicitud antes de procesar scrap.' });
+
+        return res.status(409).json({
+          message: 'El lote debe estar en la ubicación de cuarentena/purgue indicada en la solicitud antes de procesar scrap.'
+        });
       }
     } else if (sourceLocationId !== null) {
-      if (lotRow.CurrentLocationID == null || Number(lotRow.CurrentLocationID) !== sourceLocationId) {
+      if (
+        lotRow.CurrentLocationID == null ||
+        Number(lotRow.CurrentLocationID) !== sourceLocationId
+      ) {
         await connection.rollback();
-        return res.status(409).json({ message: 'El lote no está en la ubicación de origen indicada en la solicitud.' });
+
+        return res.status(409).json({
+          message: 'El lote no está en la ubicación de origen indicada en la solicitud.'
+        });
       }
     }
 
     const availableQty = Number(lotRow.CurrentQuantity || 0);
+
     if (availableQty <= 0) {
       await connection.rollback();
-      return res.status(409).json({ message: 'El lote no tiene cantidad disponible para scrap.' });
+
+      return res.status(409).json({
+        message: 'El lote no tiene cantidad disponible para scrap.'
+      });
     }
 
-    const maxQty = Math.min(availableQty, Number(requestRow.RequestQuantity || 0));
+    const maxQty = Math.min(
+      availableQty,
+      Number(requestRow.RequestQuantity || 0)
+    );
+
     if (parsedQty > maxQty) {
       await connection.rollback();
-      return res.status(400).json({ message: `La cantidad de scrap no puede exceder ${maxQty}.` });
+
+      return res.status(400).json({
+        message: `La cantidad de scrap no puede exceder ${maxQty}.`
+      });
     }
 
     const [updateResult] = await connection.query(`
       UPDATE MES_LOT_INVENTORY
       SET CurrentQuantity = CurrentQuantity - ?
-      WHERE LotInventoryID = ? AND CurrentQuantity >= ?
-    `, [parsedQty, requestRow.LotInventoryID, parsedQty]);
+      WHERE LotInventoryID = ?
+        AND CurrentQuantity >= ?
+    `, [
+      parsedQty,
+      requestRow.LotInventoryID,
+      parsedQty
+    ]);
 
     if (updateResult.affectedRows === 0) {
-      return res.status(409).json({ message: 'No hay suficiente cantidad disponible en el lote para scrap.' });
+      await connection.rollback();
+
+      return res.status(409).json({
+        message: 'No hay suficiente cantidad disponible en el lote para scrap.'
+      });
     }
+
+    const movementComments =
+      `${normalizedScrapType}${normalizedComments ? ` | ${normalizedComments}` : ''}`;
 
     const [movementResult] = await connection.query(`
       INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
@@ -2735,7 +2843,8 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
         Comments,
         OriginalInternalLot,
         NewInternalLot
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       requestId,
       requestRow.PartNumber,
@@ -2746,38 +2855,64 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       destinationLocationId,
       normalizedUserId,
       normalizedUserId,
-      `${normalizedScrapType}${normalizedComments ? ` | ${normalizedComments}` : ''}`,
+      movementComments,
       requestRow.CurrentInternalLot || null,
-      'SCRAP',
+      'SCRAP'
     ]);
 
     const [scrapResult] = await connection.query(`
-      INSERT INTO MES_SCRAP_AND_DISCREPANCIES (PartNumber, Quantity, LocationID, RegUserID, Comments, MovementID)
+      INSERT INTO MES_SCRAP_AND_DISCREPANCIES (
+        PartNumber,
+        Quantity,
+        LocationID,
+        RegUserID,
+        Comments,
+        MovementID
+      )
       VALUES (?, ?, ?, ?, ?, ?)
     `, [
       requestRow.PartNumber,
       parsedQty,
       destinationLocationId || sourceLocationId || null,
       normalizedUserId,
-      `${normalizedScrapType}${normalizedComments ? ` | ${normalizedComments}` : ''}`,
-      movementResult.insertId,
+      movementComments,
+      movementResult.insertId
     ]);
 
     let newScrapRequestId = null;
+
     if (!isScrapRequest) {
       const [scrapLocationRows] = await connection.query(`
-        SELECT LocationID, LocationName
+        SELECT
+          LocationID,
+          LocationName
         FROM PLANT_LOCATIONS
         WHERE LOWER(LocationName) LIKE '%quarantine rejection%'
-          OR LOWER(LocationName) LIKE '%confirmed scrap%'
+           OR LOWER(LocationName) LIKE '%confirmed scrap%'
       `);
 
-      const normalizeLocation = (value) => String(value || '').trim().toLowerCase();
-      const scrapSourceLocationRow = scrapLocationRows.find((row) => normalizeLocation(row.LocationName).includes('quarantine rejection'));
-      const scrapDestinationLocationRow = scrapLocationRows.find((row) => normalizeLocation(row.LocationName).includes('confirmed scrap'));
+      const normalizeLocation = (value) =>
+        String(value || '').trim().toLowerCase();
 
-      const scrapSourceLocationId = scrapSourceLocationRow ? Number(scrapSourceLocationRow.LocationID) : 4;
-      const scrapDestinationLocationId = scrapDestinationLocationRow ? Number(scrapDestinationLocationRow.LocationID) : 19;
+      const scrapSourceLocationRow = scrapLocationRows.find(
+        (row) =>
+          normalizeLocation(row.LocationName)
+            .includes('quarantine rejection')
+      );
+
+      const scrapDestinationLocationRow = scrapLocationRows.find(
+        (row) =>
+          normalizeLocation(row.LocationName)
+            .includes('confirmed scrap')
+      );
+
+      const scrapSourceLocationId = scrapSourceLocationRow
+        ? Number(scrapSourceLocationRow.LocationID)
+        : 4;
+
+      const scrapDestinationLocationId = scrapDestinationLocationRow
+        ? Number(scrapDestinationLocationRow.LocationID)
+        : 19;
 
       const [newRequestResult] = await connection.query(`
         INSERT INTO INVENTORY_REQUESTS (
@@ -2790,7 +2925,8 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
           SourceLocationID,
           DestinationLocationID,
           LotInventoryID
-        ) VALUES (40, 6, ?, ?, ?, ?, ?, ?, ?)
+        )
+        VALUES (40, 6, ?, ?, ?, ?, ?, ?, ?)
       `, [
         requestRow.PartNumber,
         parsedQty,
@@ -2798,16 +2934,25 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
         normalizedUserId,
         scrapSourceLocationId,
         scrapDestinationLocationId,
-        requestRow.LotInventoryID,
+        requestRow.LotInventoryID
       ]);
 
-      newScrapRequestId = newRequestResult.insertId ? Number(newRequestResult.insertId) : null;
+      newScrapRequestId = newRequestResult.insertId
+        ? Number(newRequestResult.insertId)
+        : null;
     }
 
-    await connection.query(
-      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 42, ConfirmUserID = ?, SubmitDate = NOW() WHERE RequestID = ?',
-      [normalizedUserId, requestId]
-    );
+    await connection.query(`
+      UPDATE INVENTORY_REQUESTS
+      SET
+        RequestStatusID = 42,
+        ConfirmUserID = ?,
+        SubmitDate = NOW()
+      WHERE RequestID = ?
+    `, [
+      normalizedUserId,
+      requestId
+    ]);
 
     await connection.commit();
 
@@ -2818,8 +2963,9 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       scrapId: scrapResult.insertId,
       newScrapRequestId,
       deductedQty: parsedQty,
-      remainingLotQuantity: availableQty - parsedQty,
+      remainingLotQuantity: availableQty - parsedQty
     });
+
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -4011,7 +4157,6 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
   if (!requestRow) {
     return res.status(404).json({ message: "La solicitud no existe." });
   }
-  // Allow transfer execution for Transfer (2), Consumption (3), Scrap relocation (6), and Partial Transfer (12) types
   if (![2, 3, 6, 12].includes(Number(requestRow.RequestTypeID))) {
     return res.status(409).json({ message: "Esta operación solo aplica a solicitudes de Transferencia, Consumo, Transferencia parcial o Scrap." });
   }
@@ -4091,26 +4236,10 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
     }
 
     const normalizedComments = comments ? String(comments).trim() : null;
-    const [movementResult] = await connection.query(`
-      INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
-        RequestID, PartNumber, StorageID, Quantity, MovementTypeID,
-        SourceLocationID, DestinationLocationID, RegUserID, ConfirmUserID,
-        Comments, OriginalInternalLot, NewInternalLot
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      requestId,
-      partNumber,
-      null,
-      parsedQty,
-      2,
-      requestRow.SourceLocationID,
-      requestRow.DestinationLocationID,
-      parsedUserId || requestRow.RegUserID,
-      parsedUserId || requestRow.RegUserID,
-      normalizedComments,
-      null,
-      'TRANSFER',
-    ]);
+
+    // NOTA: ya NO insertamos aquí en INVENTORY_MOVEMENTS_HISTORY.
+    // upsertInventoryFromLot es ahora la única fuente del registro de movimiento,
+    // para evitar la doble inserción (una manual + una dentro de la función).
 
     const requestStatusBefore = Number(requestRow.RequestStatusID);
     const [updateRequestStatusResult] = await connection.query(
@@ -4118,8 +4247,9 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       [parsedUserId || requestRow.RegUserID, requestId]
     );
 
+    let movementId = null;
     if (shouldApplyInventoryUpdate(42, Number(requestRow.RequestTypeID), Number(requestRow.LotInventoryID))) {
-      await upsertInventoryFromLot(connection, {
+      const upsertResult = await upsertInventoryFromLot(connection, {
         requestId,
         lotInventoryId: requestRow.LotInventoryID,
         partNumber: partNumber,
@@ -4131,6 +4261,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
         requestStatusId: 42,
         requestTypeId: Number(requestRow.RequestTypeID),
       });
+      movementId = upsertResult?.movementId ?? null;
     }
 
     await connection.commit();
@@ -4139,12 +4270,19 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
 
     res.json({
       ok: true,
-      movementId: movementResult.insertId,
+      movementId,
       quantity: parsedQty,
       message: "Transferencia confirmada correctamente.",
     });
   } catch (error) {
     await connection.rollback().catch(() => {});
+    // LOG del error real de MySQL/Node antes de relanzarlo — esto es lo que nos faltaba ver.
+    console.error(`[transfer] ERROR requestId=${requestId}:`, {
+      message: error.message,
+      code: error.code,
+      sqlMessage: error.sqlMessage,
+      sql: error.sql,
+    });
     throw error;
   } finally {
     connection.release();
@@ -4814,6 +4952,139 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
 
   res.json({ id: user.UserID, name: payload.name, role: roleName, token });
 }));
+
+// ERPNext Endpoints
+app.post(
+  "/api/erp/create-stock-entry",
+  asyncRoute(async (req, res) => {
+    const requestId = Number(req.body?.request_id);
+    let requestTypeId = Number(req.body?.request_type_id);
+
+    if (!Number.isInteger(requestId)) {
+      return res.status(400).json({
+        message: "El identificador de la solicitud es requerido.",
+      });
+    }
+
+    // El frontend no siempre manda request_type_id (p.ej. al entrar a una solicitud
+    // por URL directa sin pasar por la lista que lo trae). En vez de fallar, lo
+    // resolvemos desde MES_DB con el request_id, que siempre es la fuente de verdad.
+    if (!Number.isInteger(requestTypeId)) {
+      const [typeRows] = await pool.query("SELECT RequestTypeID FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
+      if (!typeRows[0]) {
+        return res.status(404).json({ message: `La solicitud #${requestId} no existe.` });
+      }
+      requestTypeId = Number(typeRows[0].RequestTypeID);
+      console.warn(`[erp/create-stock-entry] request_type_id no vino en el body para requestId=${requestId}; se resolvió desde MES_DB como ${requestTypeId}.`);
+    }
+
+    const erpResult = await erpClient.createEntryForRequestType(requestId, requestTypeId);
+
+    if (erpResult.ok) {
+      return res.json({ ok: true, erp: erpResult.data, message: erpResult.message });
+    }
+
+    // Solo revertimos si la solicitud sigue en DRAFT (40): si ya avanzó por otro medio
+    // mientras esperábamos al ERP, borrarla destruiría trabajo válido de otro usuario.
+    const [deleteResult] = await pool.query(
+      "DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ? AND RequestStatusID = 40",
+      [requestId]
+    );
+    const rolledBack = deleteResult.affectedRows > 0;
+
+    console.error(`[erp/create-stock-entry] ERP rechazó requestId=${requestId}: ${erpResult.message}. rolledBack=${rolledBack}`);
+
+    return res.status(502).json({
+      message: rolledBack
+        ? `El ERP rechazó la solicitud; el registro #${requestId} en MES_DB fue eliminado.`
+        : `El ERP rechazó la solicitud y el registro #${requestId} ya no estaba en DRAFT, por lo que no se eliminó automáticamente. Requiere revisión manual.`,
+      erp: erpResult,
+      rolledBack,
+    });
+  })
+);
+
+app.put(
+  "/api/erp/submit-stock-entry",
+  asyncRoute(async (req, res) => {
+    const requestId = Number(req.body?.request_id);
+    let requestTypeId = Number(req.body?.request_type_id);
+    const qty = Number(req.body?.qty);
+    const batchNo = req.body?.batch_no;
+
+    if (!Number.isInteger(requestId) || !Number.isFinite(qty) || qty <= 0 || !batchNo) {
+      return res.status(400).json({
+        message: "El identificador de la solicitud, la cantidad y el lote son requeridos.",
+      });
+    }
+
+    if (!Number.isInteger(requestTypeId)) {
+      const [typeRows] = await pool.query("SELECT RequestTypeID FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
+      if (!typeRows[0]) {
+        return res.status(404).json({ message: `La solicitud #${requestId} no existe.` });
+      }
+      requestTypeId = Number(typeRows[0].RequestTypeID);
+      console.warn(`[erp/submit-stock-entry] request_type_id no vino en el body para requestId=${requestId}; se resolvió desde MES_DB como ${requestTypeId}.`);
+    }
+
+    const erpResult = await erpClient.submitEntryForRequestType({ requestId, requestTypeId, qty, batchNo });
+
+    if (erpResult.ok) {
+      return res.json({ ok: true, erp: erpResult.data, message: erpResult.message });
+    }
+
+    console.error(`[erp/submit-stock-entry] ERP rechazó requestId=${requestId}: ${erpResult.message}`);
+
+    const connection = await pool.getConnection();
+    let compensation = { reversed: false, reason: 'not_attempted' };
+    try {
+      await connection.beginTransaction();
+
+      const [requestRows] = await connection.query(
+        "SELECT RequestID, RequestTypeID, RequestStatusID, LotInventoryID, SourceLocationID FROM INVENTORY_REQUESTS WHERE RequestID = ? FOR UPDATE",
+        [requestId]
+      );
+      const requestRow = requestRows[0];
+
+      // Solo revertimos si la solicitud sigue exactamente en el estado que dejó la
+      // ejecución (42): si algo más ya la movió, no adivinamos y dejamos la reversión
+      // para revisión manual en vez de arriesgar corromper inventario real.
+      if (requestRow && Number(requestRow.RequestStatusID) === 42) {
+        compensation = await reverseSubmittedMovement(connection, {
+          requestId,
+          requestTypeId: requestRow.RequestTypeID,
+          lotInventoryId: requestRow.LotInventoryID,
+          sourceLocationId: requestRow.SourceLocationID,
+        });
+
+        if (compensation.reversed) {
+          await connection.query(
+            "UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, SubmitDate = NULL WHERE RequestID = ?",
+            [requestId]
+          );
+        }
+      } else {
+        compensation = { reversed: false, reason: requestRow ? 'unexpected_status' : 'request_not_found' };
+      }
+
+      await connection.commit();
+    } catch (compensationError) {
+      await connection.rollback().catch(() => {});
+      console.error(`[erp/submit-stock-entry] Falló la reversión compensatoria para requestId=${requestId}:`, compensationError);
+      compensation = { reversed: false, reason: 'compensation_failed' };
+    } finally {
+      connection.release();
+    }
+
+    return res.status(502).json({
+      message: compensation.reversed
+        ? `El ERP rechazó la confirmación; el movimiento de la solicitud #${requestId} en MES_DB fue revertido.`
+        : `El ERP rechazó la confirmación y no se pudo revertir automáticamente el movimiento de la solicitud #${requestId} (${compensation.reason}). Requiere revisión manual.`,
+      erp: erpResult,
+      rolledBack: compensation.reversed,
+    });
+  })
+)
 
 app.use((_req, res) => {
   res.status(404).json({ message: "Ruta no encontrada" });

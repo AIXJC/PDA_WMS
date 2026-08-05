@@ -89,6 +89,7 @@ export const Transfers: React.FC = () => {
             LotInventoryID: req.LotInventoryID ? Number(req.LotInventoryID) : undefined,
             LotReceiveID: req.LotReceiveID ? Number(req.LotReceiveID) : undefined,
             RequestStatusID: req.RequestStatusID ? Number(req.RequestStatusID) : undefined,
+            RequestTypeID: req.RequestTypeID ? Number(req.RequestTypeID) : undefined,
           };
           void execute(normalized);
         }
@@ -232,11 +233,33 @@ export const Transfers: React.FC = () => {
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.message || 'Error executing transfer');
-      const warning = d.mapWarning ? `\n\nAviso: el mapa del ERP no se pudo actualizar (${d.mapWarning}), pero la transferencia sí se confirmó.` : '';
-      alert(`${d.message || 'Transferencia confirmada correctamente.'}${warning}`);
+
+      // La transferencia ya se confirmó en la BD en este punto.
+      // Refrescamos SIEMPRE aquí, sin importar lo que pase con el ERP después.
       setShowStorageModal(false);
       notifyAppRefresh('action');
       await load(false);
+
+      try {
+        const responseERP = await fetch('/api/erp/submit-stock-entry', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            request_id: currentRequest.RequestID,
+            request_type_id: currentRequest.RequestTypeID,
+            qty: parsedQuantity,
+            batch_no: lotTraceabilityByRequest[currentRequest.RequestID]?.InternalLot
+          }),
+        });
+        const dataERP = await responseERP.json();
+          if (!responseERP.ok) {
+            throw new Error('Error al actualizar el movimiento en MES Web');
+          }
+          alert('Transferencia confirmada correctamente.');
+        } catch (erpError: unknown) {
+          const erpMessage = erpError instanceof Error ? erpError.message : String(erpError);
+          alert(`Transferencia confirmada correctamente, pero falló la sincronización con el ERP: ${erpMessage}`);
+        }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       alert(message);

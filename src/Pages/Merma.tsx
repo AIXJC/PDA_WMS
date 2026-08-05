@@ -83,9 +83,9 @@ export const Merma: React.FC = () => {
       if (showLoading) {
         setRequestError('');
       }
-      const response = await fetch('/api/scrap/requests?limit=20');
+      const response = await fetch('/api/scrap/requests');
       if (!response.ok) throw new Error('No se pudieron cargar las solicitudes de scrap.');
-      const data = await response.json();
+      const data = await response.json();    
       setScrapRequests(Array.isArray(data.requests) ? data.requests : []);
     } catch (err) {
       if (showLoading) {
@@ -155,7 +155,7 @@ export const Merma: React.FC = () => {
   const pendingFollowUpScrap = recentScrap.filter((item) => String(item.Comments || '').includes('SCRAP_PENDIENTE'));
   const pendingScrapRequests = scrapRequests.filter((request) => Number(request.RequestStatusID) === 40);
   // Include both approved (41) and executed (42) in the approved tab
-  const executedScrapRequests = scrapRequests.filter((request) => Number(request.RequestStatusID) === 42);
+  const executedScrapRequests = scrapRequests.filter((request) => Number(request.RequestStatusID) === 41);
   const selectedScrapRequestAvailableQty = selectedScrapRequest ? Number(selectedScrapRequest.CurrentQuantity ?? selectedScrapRequest.LotCurrentQuantity ?? 0) : 0;
   const selectedScrapRequestMaxQty = selectedScrapRequest ? Math.min(Number(selectedScrapRequest.Quantity ?? 0), selectedScrapRequestAvailableQty) : 0;
   const requestStatusLabel = (status: number) => {
@@ -279,9 +279,37 @@ export const Merma: React.FC = () => {
         throw new Error(body.message || 'No se pudo procesar la solicitud de scrap.');
       }
 
+      try {
+        console.log({
+            request_id: selectedScrapRequest.RequestID,
+            request_type_id: selectedScrapRequest.RequestTypeID,
+            qty: scrapRequestQuantity,
+            batch_no: selectedScrapRequest.CurrentInternalLot
+          })
+
+        const responseERP = await fetch('/api/erp/submit-stock-entry', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            request_id: selectedScrapRequest.RequestID,
+            request_type_id: selectedScrapRequest.RequestTypeID,
+            qty: scrapRequestQuantity,
+            batch_no: selectedScrapRequest.CurrentInternalLot
+          }),
+        });
+        const dataERP = await responseERP.json();
+          if (!responseERP.ok) {
+            throw new Error('Error al actualizar el movimiento en MES Web');
+          }
+          alert('Transferencia confirmada correctamente.');
+        } catch (erpError: unknown) {
+          const erpMessage = erpError instanceof Error ? erpError.message : String(erpError);
+          alert(`Transferencia confirmada correctamente, pero falló la sincronización con el ERP: ${erpMessage}`);
+      }
+
       const successMessage = body.newScrapRequestId
         ? `Scrap procesado correctamente. Se creó solicitud de scrap #${body.newScrapRequestId}.`
-        : 'Scrap procesado correctamente.';
+        : 'Scrap procesado correctamente.';      
 
       setScrapRequestSuccess(successMessage);
       await loadScrapRequests(false);
@@ -327,6 +355,26 @@ export const Merma: React.FC = () => {
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(body.message || 'No se pudo crear la solicitud de scrap.');
+      }
+
+      const responseERP = await fetch(
+        '/api/erp/create-stock-entry',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            request_id: body.requestId,
+            request_type_id: 6,
+          }),
+        }
+      )
+
+      const dataERP = await responseERP.json();
+
+      if (!responseERP.ok) {
+        throw new Error(
+          dataERP.message || 'Error al crear el movimiento en MES Web'
+        );
       }
 
       await loadScrapRequests(false);

@@ -433,7 +433,28 @@ export const Requests: React.FC = () => {
         body: JSON.stringify(payload),
       });
       const d = await r.json();
+      
       if (!r.ok) throw new Error(d.message || 'No se pudo crear la solicitud');
+
+      const responseERP = await fetch(
+        '/api/erp/create-stock-entry',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            request_id: d.requestId,
+            request_type_id: selectedRequestTypeId
+          }),
+        }
+      )
+      
+      const dataERP = await responseERP.json();
+
+      if (!responseERP.ok) {
+        throw new Error(
+          dataERP.message || 'Error al crear el movimiento en MES Web'
+        );
+      }
 
       setForm({ RequestName: '', PartNumber: '', Quantity: '1', Comments: '', RequestTypeID: '2', SourceLocationID: '', DestinationLocationID: '', LotReceiveID: '' });
       setSelectedInventoryItem(null);
