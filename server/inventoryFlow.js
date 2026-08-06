@@ -162,4 +162,25 @@ async function reverseSubmittedMovement(connection, { requestId, requestTypeId, 
   return { reversed: true, movementId: movement.MovementID, quantity, wasScrapMovement: isScrapMovement };
 }
 
-export { shouldApplyInventoryUpdate, getInventoryDelta, upsertInventoryFromLot, reverseSubmittedMovement };
+async function getStorageFromLot(connection, requestId) {
+  const [rows] = await connection.query(`
+    SELECT
+      sl.StorageID,
+      req.PartNumber,
+      li.CurrentInternalLot
+    FROM INVENTORY_REQUESTS req
+    INNER JOIN MES_LOT_INVENTORY li
+      ON li.LotInventoryID = req.LotInventoryID
+    INNER JOIN MES_INVENTORY inv
+      ON inv.InventoryID = li.InventoryID
+    INNER JOIN STORAGE_LOCATIONS sl
+      ON sl.StorageID = inv.RackLocationID
+    WHERE req.RequestID = ?
+      AND li.CurrentLocationID = 5
+    LIMIT 1
+  `, [requestId]);
+
+  return rows[0] || null;
+}
+
+export { shouldApplyInventoryUpdate, getInventoryDelta, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot };

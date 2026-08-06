@@ -8,7 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import * as erpClient from "./erpClient.js";
 import { buildInboundTransferRequestPayload } from './receiptFlow.js';
-import { shouldApplyInventoryUpdate, upsertInventoryFromLot, reverseSubmittedMovement } from './inventoryFlow.js';
+import { shouldApplyInventoryUpdate, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot } from './inventoryFlow.js';
 
 dotenv.config({ path: "server/.env" });
 dotenv.config();
@@ -3919,6 +3919,11 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       return res.status(404).json({ message: 'El lote de inventario asociado no fue encontrado.' });
     }
 
+    const storage = await getStorageFromLot(
+      connection,
+      requestId
+    );
+
     const lotCurrentQuantity = Number(lotRow.CurrentQuantity || 0);
     if (lotCurrentQuantity <= 0) {
       await connection.rollback();
@@ -3976,26 +3981,76 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       movementId = upsertResult?.movementId ?? null;
     }
 
+    /*
+     * =====================================================
+     * SINCRONIZACIÓN CON ERP
+     * =====================================================
+     *
+     * Solo buscamos el rack cuando el lote está
+     * actualmente en LocationID = 5.
+     */
+    let erpWithdrawResult = null;
+
+    if (storage) {
+      const erpResponse = await fetch(
+        process.env.ERP_WITHDRAW_MATERIAL_URL,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `token ${process.env.ERP_API_TOKEN}`,
+          },
+          body: JSON.stringify({
+            mes_storage_id: Number(storage.StorageID),
+            item_code: String(storage.PartNumber),
+            batch: String(storage.CurrentInternalLot || ''),
+            quantity: parsedQty,
+          }),
+        }
+      );
+
+      erpWithdrawResult = await erpResponse.json();
+
+      if (!erpResponse.ok) {
+        await connection.rollback();
+
+        return res.status(502).json({
+          message: 'La transferencia se realizó en MES, pero falló el retiro de material del rack en ERP.',
+          erp: erpWithdrawResult,
+        });
+      }
+    }
+
     await connection.commit();
 
-    console.log(`[transfer] requestId=${requestId} statusBefore=${requestStatusBefore} statusAfter=42 affectedRows=${updateRequestStatusResult.affectedRows}`);
+    console.log(
+      `[transfer] requestId=${requestId} statusAfter=42 affectedRows=${updateRequestStatusResult.affectedRows}`
+    );
 
     res.json({
       ok: true,
       movementId,
       quantity: parsedQty,
+      erpWithdraw: erpWithdrawResult,
       message: "Transferencia confirmada correctamente.",
     });
+
   } catch (error) {
+
     await connection.rollback().catch(() => {});
-    // LOG del error real de MySQL/Node antes de relanzarlo — esto es lo que nos faltaba ver.
-    console.error(`[transfer] ERROR requestId=${requestId}:`, {
-      message: error.message,
-      code: error.code,
-      sqlMessage: error.sqlMessage,
-      sql: error.sql,
-    });
+
+    console.error(
+      `[transfer] ERROR requestId=${requestId}:`,
+      {
+        message: error.message,
+        code: error.code,
+        sqlMessage: error.sqlMessage,
+        sql: error.sql,
+      }
+    );
+
     throw error;
+
   } finally {
     connection.release();
   }
