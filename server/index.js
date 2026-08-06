@@ -843,6 +843,18 @@ app.get("/api/cyclic-count/:id", asyncRoute(async (req, res) => {
   res.json({ cycle: rows[0] });
 }));
 
+function describeErpCountResult(payload) {
+  if (typeof payload === 'string') return payload;
+  if (!payload || typeof payload !== 'object') return null;
+  const parts = [];
+  if (payload.result) parts.push(String(payload.result));
+  if (payload.difference !== undefined && payload.difference !== null) {
+    parts.push(`Diferencia: ${payload.difference}`);
+  }
+  if (parts.length) return parts.join(' · ');
+  return payload.status ? String(payload.status) : null;
+}
+
 app.post("/api/cyclic-count/:id/scan", asyncRoute(async (req, res) => {
   const cycleId = Number(req.params.id);
   const batch = String(req.body?.batch || '').trim();
@@ -893,7 +905,7 @@ app.post("/api/cyclic-count/:id/scan", asyncRoute(async (req, res) => {
 
   if (!erpResult.ok) {
     return res.status(erpResult.status && erpResult.status >= 400 ? erpResult.status : 502).json({
-      message: erpResult.message || 'Error al registrar el conteo en el ERP',
+      message: describeErpCountResult(erpResult.message) || 'Error al registrar el conteo en el ERP',
       batch,
       countedQuantity,
     });
@@ -904,7 +916,7 @@ app.post("/api/cyclic-count/:id/scan", asyncRoute(async (req, res) => {
     batch,
     countId: cycle.ERPCycleCountID,
     countedQuantity,
-    message: erpResult.message || 'Conteo registrado correctamente',
+    message: describeErpCountResult(erpResult.message) || 'Conteo registrado correctamente',
   });
 }));
 
