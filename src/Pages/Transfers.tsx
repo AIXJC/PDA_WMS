@@ -206,62 +206,94 @@ export const Transfers: React.FC = () => {
       alert('No hay solicitud seleccionada.');
       return;
     }
+
     const parsedQuantity = Number(quantityInput);
+
     if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
       alert('Ingresa la cantidad realmente transferida');
       return;
     }
 
     const locationLabel = currentRequest.DestinationLocationID
-      ? (locationNames[currentRequest.DestinationLocationID] || `#${currentRequest.DestinationLocationID}`)
+      ? (
+          locationNames[currentRequest.DestinationLocationID] ||
+          `#${currentRequest.DestinationLocationID}`
+        )
       : 'Sin destino definido';
 
-    if (!confirm(`${t('transfers.confirmExecute')}\n${currentRequest.PartNumber} x ${parsedQuantity}\nDestino: ${locationLabel}\n\nPara salidas parciales, el lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada.`)) return;
+    if (
+      !confirm(
+        `${t('transfers.confirmExecute')}\n` +
+        `${currentRequest.PartNumber} x ${parsedQuantity}\n` +
+        `Destino: ${locationLabel}\n\n` +
+        `Para salidas parciales, el lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada.`
+      )
+    ) {
+      return;
+    }
 
     try {
       setExecuting(currentRequest.RequestID);
-      const body = {
-        regUserId: user?.id || null,
-        quantity: parsedQuantity,
-        sourceLocationId: currentRequest.SourceLocationID || null,
-        destinationLocationId: currentRequest.DestinationLocationID || null,
-      };
-      const r = await fetch(`/api/requests/${currentRequest.RequestID}/execute-transfer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.message || 'Error executing transfer');
 
-      // La transferencia ya se confirmó en la BD en este punto.
-      // Refrescamos SIEMPRE aquí, sin importar lo que pase con el ERP después.
+      // 1. Ejecutar transferencia en MES
+      const r = await fetch(
+        `/api/requests/${currentRequest.RequestID}/execute-transfer`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            regUserId: user?.id || null,
+            quantity: parsedQuantity,
+            sourceLocationId: currentRequest.SourceLocationID || null,
+            destinationLocationId: currentRequest.DestinationLocationID || null,
+          }),
+        }
+      );
+
+      const d = await r.json();
+
+      if (!r.ok) {
+        throw new Error(
+          d.message || 'Error executing transfer'
+        );
+      }
+
+      // 2. Confirmar movimiento en ERP
+      const responseERP = await fetch('/api/erp/submit-stock-entry', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          request_id: currentRequest.RequestID,
+          request_type_id: currentRequest.RequestTypeID,
+          qty: parsedQuantity,
+          batch_no:
+            lotTraceabilityByRequest[currentRequest.RequestID]?.InternalLot,
+        }),
+      });
+
+      const dataERP = await responseERP.json();
+
+      if (!responseERP.ok) {
+        throw new Error(
+          dataERP.message || 'Error al actualizar el movimiento en ERP'
+        );
+      }
+
+      // 3. Refrescar interfaz
       setShowStorageModal(false);
       notifyAppRefresh('action');
       await load(false);
 
-      try {
-        const responseERP = await fetch('/api/erp/submit-stock-entry', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            request_id: currentRequest.RequestID,
-            request_type_id: currentRequest.RequestTypeID,
-            qty: parsedQuantity,
-            batch_no: lotTraceabilityByRequest[currentRequest.RequestID]?.InternalLot
-          }),
-        });
-        const dataERP = await responseERP.json();
-          if (!responseERP.ok) {
-            throw new Error('Error al actualizar el movimiento en MES Web');
-          }
-          alert('Transferencia confirmada correctamente.');
-        } catch (erpError: unknown) {
-          const erpMessage = erpError instanceof Error ? erpError.message : String(erpError);
-          alert(`Transferencia confirmada correctamente, pero falló la sincronización con el ERP: ${erpMessage}`);
-        }
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : String(e);
+      alert('Transferencia confirmada correctamente.');
+
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : String(e);
+
       alert(message);
     } finally {
       setExecuting(null);
