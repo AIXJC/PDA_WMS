@@ -5,14 +5,6 @@ import { Layout } from '../Components/Layout';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as mobileFeatures from '../utils/mobileFeatures';
 
-let BrowserMultiFormatReader: any = null;
-try {
-  const zxing = require('@zxing/browser');
-  BrowserMultiFormatReader = zxing.BrowserMultiFormatReader;
-} catch (error) {
-  console.warn('ZXing not available, scanner fallback disabled', error);
-}
-
 interface CycleDetail {
   CycleCountID: number;
   ERPCycleCountID: string | null;
@@ -49,11 +41,9 @@ export const CyclicCountScan: React.FC = () => {
   const [loadError, setLoadError] = useState('');
   const [scans, setScans] = useState<ScanEntry[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [cameraError, setCameraError] = useState('');
+  const [scanInput, setScanInput] = useState('');
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const readerRef = useRef<any>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const lastScanRef = useRef<{ code: string; time: number } | null>(null);
   const processingRef = useRef(false);
 
@@ -133,93 +123,18 @@ export const CyclicCountScan: React.FC = () => {
     } finally {
       processingRef.current = false;
       setIsProcessing(false);
+      setScanInput('');
+      window.setTimeout(() => inputRef.current?.focus(), 50);
     }
   }, [id]);
 
-  useEffect(() => {
-    let rafId: number | null = null;
-    let cancelled = false;
+  const handleSubmitScan = useCallback(() => {
+    void handleDetected(scanInput);
+  }, [handleDetected, scanInput]);
 
-    const startCameraAndDecode = async () => {
-      try {
-        const stream = await mobileFeatures.requestCamera('environment');
-        if (cancelled) {
-          mobileFeatures.stopStream(stream);
-          return;
-        }
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-        }
-
-        const hasNative = (window as any).BarcodeDetector;
-        if (hasNative) {
-          const formats = ['code_128', 'ean_13', 'ean_8', 'qr_code', 'code_39', 'code_93'];
-          const detector = new (window as any).BarcodeDetector({ formats });
-
-          const detectLoop = async () => {
-            try {
-              if (!videoRef.current || videoRef.current.readyState < 2) {
-                rafId = requestAnimationFrame(detectLoop);
-                return;
-              }
-              const barcodes = await detector.detect(videoRef.current as HTMLVideoElement);
-              if (barcodes && barcodes.length) {
-                const raw = barcodes[0].rawValue || barcodes[0].raw_text || barcodes[0].displayValue;
-                if (raw) await handleDetected(raw);
-              }
-            } catch (err) {
-              console.warn('BarcodeDetector error', err);
-            }
-            rafId = requestAnimationFrame(detectLoop);
-          };
-
-          detectLoop();
-          return;
-        }
-
-        try {
-          if (BrowserMultiFormatReader) {
-            const codeReader = new BrowserMultiFormatReader();
-            readerRef.current = codeReader;
-            if (videoRef.current) {
-              codeReader.decodeFromVideoElement(videoRef.current, (result: any) => {
-                if (result && result.getText) {
-                  void handleDetected(result.getText());
-                }
-              });
-            }
-          } else {
-            setCameraError('El escaneo por cámara no está disponible en este dispositivo.');
-          }
-        } catch (err) {
-          console.warn('ZXing fallback failed', err);
-          setCameraError('El escaneo por cámara no está disponible en este dispositivo.');
-        }
-      } catch (error) {
-        console.error('Camera start failed', error);
-        setCameraError('No se pudo acceder a la cámara/escáner del dispositivo.');
-      }
-    };
-
-    void startCameraAndDecode();
-
-    return () => {
-      cancelled = true;
-      if (rafId) cancelAnimationFrame(rafId);
-      if (readerRef.current && readerRef.current.reset) {
-        try { readerRef.current.reset(); } catch { /* noop */ }
-      }
-      if (streamRef.current) {
-        mobileFeatures.stopStream(streamRef.current);
-        streamRef.current = null;
-      }
-      if (videoRef.current) {
-        try { videoRef.current.pause(); videoRef.current.srcObject = null; } catch { /* noop */ }
-      }
-    };
-  }, [handleDetected]);
+  const handleInputBlur = useCallback(() => {
+    window.setTimeout(() => inputRef.current?.focus(), 200);
+  }, []);
 
   const locationLabel = cycle
     ? (cycle.RackName ? `${cycle.RackName}-${Number(cycle.RackColumn || 0)}-${Number(cycle.RackCell || 0)}` : cycle.LocationCode || '')
@@ -270,31 +185,46 @@ export const CyclicCountScan: React.FC = () => {
           </div>
         ) : null}
 
-        <div className="relative rounded-[2rem] overflow-hidden bg-black aspect-square">
-          <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted />
-          <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black/50 pointer-events-none" />
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="relative w-56 h-56 border-2 border-white/30 rounded-[2rem]">
-              <div className="absolute -top-1 -left-1 w-8 h-8 border-t-4 border-l-4 border-blue-500 rounded-tl-xl" />
-              <div className="absolute -top-1 -right-1 w-8 h-8 border-t-4 border-r-4 border-blue-500 rounded-tr-xl" />
-              <div className="absolute -bottom-1 -left-1 w-8 h-8 border-b-4 border-l-4 border-blue-500 rounded-bl-xl" />
-              <div className="absolute -bottom-1 -right-1 w-8 h-8 border-b-4 border-r-4 border-blue-500 rounded-br-xl" />
-              <motion.div
-                animate={{ top: ['10%', '90%', '10%'] }}
-                transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
-                className="absolute left-4 right-4 h-0.5 bg-blue-500 shadow-[0_0_15px_rgba(59,130,246,0.8)]"
-              />
-            </div>
+        <div className="rounded-[2rem] border border-slate-100 dark:border-slate-700 bg-white dark:bg-slate-800/95 p-5 shadow-sm">
+          <div className="flex items-center gap-2 text-sm font-black uppercase tracking-widest text-slate-500 dark:text-slate-300">
+            <ScanLine size={16} />
+            <span>Lector de código de barras</span>
+          </div>
+          <p className="mt-1 text-xs text-slate-400 dark:text-slate-400">
+            Usa el lector físico del PDA para escanear el lote, o escríbelo manualmente.
+          </p>
+          <div className="mt-3 flex items-center gap-2">
+            <input
+              ref={inputRef}
+              type="text"
+              inputMode="text"
+              autoComplete="off"
+              autoFocus
+              value={scanInput}
+              placeholder="Escanea o escribe el lote"
+              onChange={(e) => setScanInput(e.target.value)}
+              onBlur={handleInputBlur}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  handleSubmitScan();
+                }
+              }}
+              className="flex-1 bg-white dark:bg-slate-800/95 border-2 border-slate-100 dark:border-slate-700 rounded-2xl py-3 px-3 focus:border-blue-500 outline-none transition-all text-slate-800 dark:text-slate-100"
+            />
+            <button
+              type="button"
+              onClick={handleSubmitScan}
+              disabled={!scanInput.trim() || isProcessing}
+              className="rounded-2xl bg-blue-600 text-white px-4 py-3 text-[11px] font-black uppercase tracking-widest disabled:opacity-40 active:scale-95 transition-all"
+            >
+              Registrar
+            </button>
           </div>
           {isProcessing && (
-            <div className="absolute top-4 right-4 bg-blue-600 text-white text-[10px] font-black uppercase px-3 py-1.5 rounded-full flex items-center gap-1.5">
+            <div className="mt-3 inline-flex items-center gap-1.5 bg-blue-600 text-white text-[10px] font-black uppercase px-3 py-1.5 rounded-full">
               <LoaderCircle size={12} className="animate-spin" />
               Registrando...
-            </div>
-          )}
-          {cameraError && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/80 px-6 text-center">
-              <p className="text-white text-sm font-semibold">{cameraError}</p>
             </div>
           )}
         </div>
