@@ -138,7 +138,7 @@ export const Requests: React.FC = () => {
     setShowCreate(true);
     setForm((prev) => ({
       ...prev,
-      RequestTypeID: outboundBridge ? '12' : '3',
+      RequestTypeID: outboundBridge ? '12' : '2',
       LotReceiveID: String(lotInventoryId),
       PartNumber: prev.PartNumber || '',
       Quantity: prev.Quantity || '1',
@@ -288,13 +288,16 @@ export const Requests: React.FC = () => {
       // Exclude consumption-type and the unsupported PDA request types from the general Requests UI
       const params = new URLSearchParams(window.location.search);
       const outboundBridge = params.get('from') === 'outbound';
+      const incomingBridge = params.get('from') === 'inbound';
 
       const filteredTypes = outboundBridge
         ? allTypes.filter((t: any) => [3, 12].includes(Number(t.RequestTypeID)))
-        : allTypes.filter(
-            (t: any) =>
-              !isHiddenRequestType(t.RequestType || t.RequestDescription)
-          );
+        : incomingBridge
+          ? allTypes.filter((t: any) => Number(t.RequestTypeID) === 2)
+          : allTypes.filter(
+              (t: any) =>
+                !isHiddenRequestType(t.RequestType || t.RequestDescription)
+            );
 
       setRequestTypes(filteredTypes);
     } catch (e) {
@@ -452,24 +455,29 @@ export const Requests: React.FC = () => {
       
       if (!r.ok) throw new Error(d.message || 'No se pudo crear la solicitud');
 
-      const responseERP = await fetch(
-        '/api/erp/create-stock-entry',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            request_id: d.requestId,
-            request_type_id: selectedRequestTypeId
-          }),
-        }
-      )
-      
-      const dataERP = await responseERP.json();
+      // El backend ya sincroniza con el MES Web dentro de POST /api/requests para
+      // transferencias (d.erp viene lleno en ese caso); solo llamamos aquí cuando
+      // todavía no se sincronizó, para no duplicar la llamada al ERP.
+      if (!d.erp) {
+        const responseERP = await fetch(
+          '/api/erp/create-stock-entry',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              request_id: d.requestId,
+              request_type_id: selectedRequestTypeId
+            }),
+          }
+        )
 
-      if (!responseERP.ok) {
-        throw new Error(
-          dataERP.message || 'Error al crear el movimiento en MES Web'
-        );
+        const dataERP = await responseERP.json();
+
+        if (!responseERP.ok) {
+          throw new Error(
+            dataERP.message || 'Error al crear el movimiento en MES Web'
+          );
+        }
       }
 
       setForm({ RequestName: '', PartNumber: '', Quantity: '1', Comments: '', RequestTypeID: '2', SourceLocationID: '', DestinationLocationID: '', LotReceiveID: '' });

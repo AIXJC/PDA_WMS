@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
-import { Check, ArrowRight, X } from 'lucide-react';
+import { Check, ArrowRight, X, Box } from 'lucide-react';
 import useAuthStore from '../store/useAuthStore';
 import { motion } from 'framer-motion';
 import { useLocation } from 'react-router-dom';
@@ -53,6 +53,13 @@ export const Transfers: React.FC = () => {
   const [quantityInput, setQuantityInput] = useState('');
   const [lotTraceabilityByRequest, setLotTraceabilityByRequest] = useState<Record<number, LotTraceability | null>>({});
   const [defaultTransferQtyByRequest, setDefaultTransferQtyByRequest] = useState<Record<number, number>>({});
+  const [showRackModal, setShowRackModal] = useState(false);
+  const [rackRequest, setRackRequest] = useState<Req | null>(null);
+  const [storageLocations, setStorageLocations] = useState<StorageLocation[]>([]);
+  const [loadingStorageLocations, setLoadingStorageLocations] = useState(false);
+  const [selectedStorageLocation, setSelectedStorageLocation] = useState<StorageLocation | null>(null);
+  const [rackCodeInput, setRackCodeInput] = useState('');
+  const [completingRack, setCompletingRack] = useState<number | null>(null);
 
   useEffect(() => { void load(); }, []);
 
@@ -199,6 +206,89 @@ export const Transfers: React.FC = () => {
     setShowStorageModal(true);
     const defaultQty = defaultTransferQtyByRequest[req.RequestID] ?? Number(req.Quantity || 0);
     setQuantityInput(String(defaultQty));
+  }
+
+  const isIncomingStorageTransfer = (req: Req) => {
+    if (Number(req.RequestTypeID) !== 2) return false;
+    const sourceName = req.SourceLocationID ? String(locationNames[req.SourceLocationID] || '').toLowerCase() : '';
+    const destinationName = req.DestinationLocationID ? String(locationNames[req.DestinationLocationID] || '').toLowerCase() : '';
+    return sourceName.includes('incoming') && /stor|almac/.test(destinationName);
+  };
+
+  const getStorageLocationCode = (location: StorageLocation) => {
+    const rackName = String(location?.RackName || '').trim().toUpperCase();
+    const rackColumn = String(location?.RackColumn ?? 0);
+    const rackCell = String(location?.RackCell ?? 0);
+    return `${rackName}-${rackColumn}-${rackCell}`;
+  };
+
+  async function loadStorageLocations() {
+    setLoadingStorageLocations(true);
+    try {
+      const response = await fetch('/api/storage-locations?limit=500');
+      if (!response.ok) throw new Error('No fue posible cargar las ubicaciones de rack');
+      const data = await response.json();
+      setStorageLocations(Array.isArray(data.locations) ? data.locations : []);
+    } catch (e) {
+      setStorageLocations([]);
+      alert(e instanceof Error ? e.message : 'Error cargando ubicaciones de rack');
+    } finally {
+      setLoadingStorageLocations(false);
+    }
+  }
+
+  function handleRackCodeChange(value: string) {
+    setRackCodeInput(value.toUpperCase());
+    const normalized = value.trim().toUpperCase();
+    if (!normalized) {
+      setSelectedStorageLocation(null);
+      return;
+    }
+    const matched = storageLocations.find((loc) => getStorageLocationCode(loc) === normalized);
+    if (matched) setSelectedStorageLocation(matched);
+  }
+
+  function openRackPicker(req: Req) {
+    setRackRequest(req);
+    setSelectedStorageLocation(null);
+    setRackCodeInput('');
+    setShowRackModal(true);
+    void loadStorageLocations();
+  }
+
+  async function handleCompleteStorageTransfer() {
+    if (!rackRequest || !selectedStorageLocation) {
+      alert('Selecciona un rack de destino.');
+      return;
+    }
+
+    if (!confirm(`Confirmar traslado de ${rackRequest.PartNumber} x ${rackRequest.Quantity} al rack ${getStorageLocationCode(selectedStorageLocation)}?`)) {
+      return;
+    }
+
+    try {
+      setCompletingRack(rackRequest.RequestID);
+      const r = await fetch(`/api/requests/${rackRequest.RequestID}/complete-storage-transfer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storageId: Number(selectedStorageLocation.StorageID),
+          regUserId: user?.id || null,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.message || 'No fue posible completar la transferencia');
+
+      setShowRackModal(false);
+      setRackRequest(null);
+      notifyAppRefresh('action');
+      await load(false);
+      alert('Transferencia a rack completada correctamente.');
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCompletingRack(null);
+    }
   }
 
   async function executeTransferWithLocation() {
@@ -352,20 +442,31 @@ export const Transfers: React.FC = () => {
 
                 <div className="flex shrink-0 items-center justify-end gap-2 sm:justify-start">
                   {Number(r.RequestStatusID) === 41 ? (
-                    <button
-                      disabled={executing === r.RequestID}
-                      onClick={() => execute(r)}
-                      className="flex items-center gap-2 rounded-2xl bg-blue-600 px-4 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95 disabled:opacity-70"
-                    >
-                      {executing === r.RequestID ? (
-                        '...'
-                      ) : (
-                        <>
-                          <Check size={14} />
-                          <span>Empezar transferencia</span>
-                        </>
-                      )}
-                    </button>
+                    isIncomingStorageTransfer(r) ? (
+                      <button
+                        disabled={completingRack === r.RequestID}
+                        onClick={() => openRackPicker(r)}
+                        className="flex items-center gap-2 rounded-2xl bg-blue-600 px-4 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95 disabled:opacity-70"
+                      >
+                        <Box size={14} />
+                        <span>Seleccionar rack</span>
+                      </button>
+                    ) : (
+                      <button
+                        disabled={executing === r.RequestID}
+                        onClick={() => execute(r)}
+                        className="flex items-center gap-2 rounded-2xl bg-blue-600 px-4 py-2 text-sm font-black text-white shadow-sm transition-all active:scale-95 disabled:opacity-70"
+                      >
+                        {executing === r.RequestID ? (
+                          '...'
+                        ) : (
+                          <>
+                            <Check size={14} />
+                            <span>Empezar transferencia</span>
+                          </>
+                        )}
+                      </button>
+                    )
                   ) : null}
                   <ArrowRight size={18} className="text-slate-400" />
                 </div>
@@ -458,6 +559,102 @@ export const Transfers: React.FC = () => {
                 className="flex-1 rounded-xl bg-blue-600 px-4 py-2 font-bold text-white transition-all active:scale-95 disabled:opacity-50"
               >
                 {executing !== null ? 'Ejecutando...' : 'Ejecutar'}
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+
+      {/* Modal de selección de rack para transferencias Incoming -> Storage */}
+      {showRackModal && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+        >
+          <motion.div
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.9, opacity: 0 }}
+            className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-6 shadow-2xl dark:bg-slate-800"
+          >
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h2 className="text-lg font-black text-slate-900 dark:text-slate-100">
+                Seleccionar rack de destino
+              </h2>
+              <button
+                onClick={() => setShowRackModal(false)}
+                className="rounded-full p-2 hover:bg-slate-100 dark:hover:bg-slate-700"
+              >
+                <X size={20} className="text-slate-600 dark:text-slate-300" />
+              </button>
+            </div>
+
+            {rackRequest ? (
+              <div className="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-700/50">
+                <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">{rackRequest.PartNumber}</div>
+                <div className="mt-1 text-xs text-slate-600 dark:text-slate-300">Cantidad (lote completo): {rackRequest.Quantity}</div>
+              </div>
+            ) : null}
+
+            <label className="block">
+              <span className="text-xs font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Rack de destino</span>
+              <input
+                type="text"
+                value={rackCodeInput}
+                onChange={(e) => handleRackCodeChange(e.target.value)}
+                placeholder="Ej.: A-01-02"
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+              />
+            </label>
+
+            <div className="mt-3 flex items-center justify-between">
+              <p className="text-sm font-black text-slate-900 dark:text-slate-100">Catálogo de ubicaciones</p>
+              <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{storageLocations.length} ubicaciones</span>
+            </div>
+            {loadingStorageLocations ? (
+              <div className="py-8 text-center text-slate-500">Cargando ubicaciones...</div>
+            ) : storageLocations.length === 0 ? (
+              <div className="py-8 text-center text-slate-500">No hay ubicaciones de rack disponibles.</div>
+            ) : (
+              <div className="grid gap-2 max-h-72 overflow-y-auto pt-3">
+                {storageLocations.map((loc) => {
+                  const locationCode = getStorageLocationCode(loc);
+                  const isSelected = selectedStorageLocation?.StorageID === loc.StorageID;
+                  return (
+                    <button
+                      key={loc.StorageID}
+                      type="button"
+                      onClick={() => {
+                        setSelectedStorageLocation(loc);
+                        setRackCodeInput(locationCode);
+                      }}
+                      className={`w-full rounded-2xl border p-4 text-left transition ${isSelected ? 'border-blue-600 bg-blue-50 text-slate-900 dark:border-blue-400 dark:bg-blue-900/30 dark:text-white' : 'border-slate-200 bg-slate-50 text-slate-900 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-100'}`}
+                    >
+                      <div className="font-bold">{locationCode}</div>
+                      <div className="mt-1 text-sm opacity-80">
+                        {loc.LocationName ? `${loc.LocationName} • ` : ''}Col {loc.RackColumn} - Cel {loc.RackCell}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="mt-6 flex gap-3">
+              <button
+                onClick={() => setShowRackModal(false)}
+                className="flex-1 rounded-xl bg-slate-200 px-4 py-2 font-bold text-slate-900 transition-all active:scale-95 dark:bg-slate-700 dark:text-slate-100"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleCompleteStorageTransfer}
+                disabled={completingRack !== null || !selectedStorageLocation}
+                className="flex-1 rounded-xl bg-blue-600 px-4 py-2 font-bold text-white transition-all active:scale-95 disabled:opacity-50"
+              >
+                {completingRack !== null ? 'Completando...' : 'Marcar como completado'}
               </button>
             </div>
           </motion.div>

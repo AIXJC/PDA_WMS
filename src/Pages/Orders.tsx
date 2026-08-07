@@ -3,14 +3,11 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowDownCircle,
   ArrowUpCircle,
-  Check,
-  Scan,
   ChevronRight,
   Package,
   User,
   Calendar,
   LoaderCircle,
-  X,
 } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
@@ -112,16 +109,7 @@ export const Orders: React.FC = () => {
   const [selectedOutboundLogs, setSelectedOutboundLogs] = useState<any[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [activeReceiveLineId, setActiveReceiveLineId] = useState<number | null>(null);
-  const [scannedCounts, setScannedCounts] = useState<Record<number, number>>({});
   const [historyFilter, setHistoryFilter] = useState<'all' | 'completed' | 'in-progress' | 'pending'>('all');
-  const [showQuarantineModal, setShowQuarantineModal] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  const [destinationLocationId, setDestinationLocationId] = useState('');
-  const [sourceLocationId, setSourceLocationId] = useState('');
-  const [storageLocations, setStorageLocations] = useState<any[]>([]);
-  const [loadingStorageLocations, setLoadingStorageLocations] = useState(false);
-  const [selectedStorageLocation, setSelectedStorageLocation] = useState<any | null>(null);
-  const [rackCodeInput, setRackCodeInput] = useState('');
   const [sourceLocations, setSourceLocations] = useState<Array<{LocationID:number; LocationName:string}>>([]);
   const [destinationLocations, setDestinationLocations] = useState<Array<{LocationID:number; LocationName:string}>>([]);
   const [providerFilter, setProviderFilter] = useState('');
@@ -220,22 +208,6 @@ export const Orders: React.FC = () => {
       setInboundDetailModalOpen(false);
     }
   }, [isOutbound, isInboundDetailRoute, detailId, requestedPo, location.search, requestedStatus]);
-
-  useEffect(() => {
-    if (isOutbound || !selectedInboundOrder) return;
-
-    const loadDestinationLocations = async () => {
-      const options = await loadLocationOptions();
-      if (!options) return;
-      const nextSourceLocations = options.sourceLocations;
-      const nextDestinationLocations = options.destinationLocations;
-      if (!sourceLocationId && nextSourceLocations[0]) {
-        setSourceLocationId(String(nextSourceLocations[0].LocationID));
-      }
-    };
-
-    void loadDestinationLocations();
-  }, [isOutbound, selectedInboundOrder]);
 
   useEffect(() => {
     setSelectedOrder(null);
@@ -587,184 +559,6 @@ export const Orders: React.FC = () => {
   const selectedInboundStatusId = selectedInboundOrder
     ? Number((selectedInboundOrder as any).RequestStatusID ?? selectedInboundOrder.OrderStatusID ?? 0)
     : null;
-  const isReadonlyInboundOrder = selectedInboundStatusId === 40 || selectedInboundStatusId === 41 || selectedInboundStatusId === 42;
-
-  const inboundSummary = useMemo(() => {
-    if (isOutbound || !selectedInboundOrder) return null;
-
-    const totalExpected = selectedInboundDetails.reduce((sum, item) => sum + Number(item.Qty || 0), 0);
-    const totalReceived = selectedInboundDetails.reduce((sum, item) => sum + Number(item.ReceivedQty || 0), 0);
-    const completedCount = selectedInboundDetails.filter((item) => Number(item.ReceivedQty || 0) >= Number(item.Qty || 0)).length;
-
-    return {
-      totalExpected,
-      totalReceived,
-      completedCount,
-      progress: totalExpected > 0 ? Math.round((totalReceived / totalExpected) * 100) : 0,
-    };
-  }, [isOutbound, selectedInboundOrder, selectedInboundDetails]);
-
-  const totalScannedPieces = useMemo(() => {
-    return selectedInboundDetails.reduce((sum, item) => {
-      const count = scannedCounts[item.PurchaseOrderDetailID] || 0;
-      return sum + count;
-    }, 0);
-  }, [selectedInboundDetails, scannedCounts]);
-
-  const totalRemainingToScanPieces = useMemo(() => {
-    return selectedInboundDetails.reduce((sum, item) => {
-      const expected = Number(item.Qty || 0);
-      const received = Number(item.ReceivedQty || 0);
-      const scanned = scannedCounts[item.PurchaseOrderDetailID] || 0;
-      return sum + Math.max(0, expected - received - scanned);
-    }, 0);
-  }, [selectedInboundDetails, scannedCounts]);
-
-  const getStorageLocationCode = (location: any) => {
-    const rackName = String(location?.RackName || '').trim().toUpperCase();
-    const rackColumn = String(location?.RackColumn ?? 0);
-    const rackCell = String(location?.RackCell ?? 0);
-    return `${rackName}-${rackColumn}-${rackCell}`;
-  };
-
-  const loadStorageLocations = async () => {
-    setLoadingStorageLocations(true);
-    try {
-      const response = await fetch('/api/storage-locations?limit=500');
-      if (!response.ok) throw new Error('No fue posible cargar las ubicaciones de rack');
-      const data = await response.json();
-      const nextLocations = Array.isArray(data.locations) ? data.locations : [];
-      setStorageLocations(nextLocations);
-
-      if (nextLocations.length > 0) {
-        const preferred = nextLocations.find((loc: any) => {
-          const currentLocationId = Number(selectedLot?.CurrentLocationID || 0);
-          return currentLocationId > 0 && (Number(loc.LocationID) === currentLocationId || Number(loc.StorageID) === currentLocationId);
-        }) || nextLocations[0];
-        setSelectedStorageLocation(preferred);
-        setDestinationLocationId(String(preferred.StorageID ?? preferred.LocationID ?? ''));
-        setRackCodeInput(getStorageLocationCode(preferred));
-      }
-    } catch (err) {
-      setStorageLocations([]);
-      setError(err instanceof Error ? err.message : 'Error cargando ubicaciones de rack');
-    } finally {
-      setLoadingStorageLocations(false);
-    }
-  };
-
-  const handleScanPiece = (item: InboundOrderDetail) => {
-    const detailId = item.PurchaseOrderDetailID;
-    const current = scannedCounts[detailId] || 0;
-    const remaining = Math.max(0, Number(item.Qty || 0) - Number(item.ReceivedQty || 0) - current);
-    if (remaining <= 0) return;
-
-    setScannedCounts((prev) => ({
-      ...prev,
-      [detailId]: current + 1,
-    }));
-    setError('');
-  };
-
-  const handleOpenQuarantineModal = () => {
-    if (totalScannedPieces <= 0) {
-      setError('Debe escanear al menos una pieza antes de finalizar la recepción.');
-      return;
-    }
-
-    setShowQuarantineModal(true);
-    setError('');
-    setRackCodeInput('');
-    void loadStorageLocations();
-    if (!sourceLocationId && selectedLot?.CurrentLocationID) {
-      setSourceLocationId(String(selectedLot.CurrentLocationID));
-    }
-  };
-
-  const handleRackCodeChange = (value: string) => {
-    setRackCodeInput(value.toUpperCase());
-
-    const normalized = value.trim().toUpperCase();
-    if (!normalized) {
-      setSelectedStorageLocation(null);
-      setDestinationLocationId('');
-      return;
-    }
-
-    const matchedLocation = storageLocations.find((loc: any) => getStorageLocationCode(loc) === normalized);
-    if (matchedLocation) {
-      setSelectedStorageLocation(matchedLocation);
-      setDestinationLocationId(String(matchedLocation.StorageID ?? matchedLocation.LocationID ?? ''));
-    }
-  };
-
-  const handleConfirmOrder = async () => {
-    if (!selectedInboundOrder) return;
-    if (!selectedInboundDetails.length) return;
-
-    const scannedDetails = selectedInboundDetails
-      .map((item) => ({
-        purchaseOrderDetailID: item.PurchaseOrderDetailID,
-        scannedQty: scannedCounts[item.PurchaseOrderDetailID] || 0,
-        expectedQty: Number(item.Qty || 0),
-        currentReceivedQty: Number(item.ReceivedQty || 0),
-      }))
-      .filter((item) => item.scannedQty > 0);
-
-    if (scannedDetails.length === 0) {
-      setError('Debe escanear al menos una pieza antes de confirmar la orden.');
-      return;
-    }
-
-    const totalScanned = scannedDetails.reduce((sum, item) => sum + item.scannedQty, 0);
-
-    if (!selectedStorageLocation) {
-      setError('Debe seleccionar o escribir un rack válido que exista en el catálogo de ubicaciones.');
-      return;
-    }
-
-    setError('');
-    setConfirming(true);
-    try {
-      const requestId = Number(selectedInboundOrder?.RequestID ?? selectedInboundOrder?.PurchaseOrderID ?? 0);
-      const response = await fetch(`/api/requests/inbound/${requestId}/confirm`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          scannedDetails,
-          receivedBy: user?.id ? Number(user.id) : undefined,
-          storageId: selectedStorageLocation?.StorageID ? Number(selectedStorageLocation.StorageID) : undefined,
-          quantity: totalScanned,
-          lotReference: selectedLot?.InternalLot || selectedLot?.ShortInternalLot || selectedLot?.ProviderLot || selectedLot?.LotReceiveID || selectedLot?.ReceiveID || null,
-          lotInventoryId: selectedLot?.LotInventoryID ?? selectedLot?.LotInventoryId ?? selectedLot?.id ?? null,
-          sourceLocationId: sourceLocationId ? Number(sourceLocationId) : (selectedLot?.CurrentLocationID ? Number(selectedLot.CurrentLocationID) : undefined),
-          requestUserId: user?.id ? Number(user.id) : undefined,
-          comments: `Recepción confirmada desde ${selectedInboundOrder?.PONumber || 'PO'}`,
-        }),
-      });
-
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.message || 'No fue posible confirmar la orden');
-      }
-
-      setOrders((prev) => prev.map((order) => order.PurchaseOrderID === selectedInboundOrder.PurchaseOrderID
-        ? { ...order, StatusDescription: data.statusName, receivedQty: data.receivedQty ?? order.receivedQty }
-        : order
-      ));
-      setSelectedOrder(null);
-      setSelectedInboundOrder(null);
-      setSelectedInboundDetails([]);
-      setSelectedInboundReceipts([]);
-      setScannedCounts({});
-      setShowQuarantineModal(false);
-      setError('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'No fue posible confirmar la orden');
-    } finally {
-      setConfirming(false);
-    }
-  };
 
   if (selectedOrder && isOutbound) {
     return (
@@ -1025,208 +819,54 @@ export const Orders: React.FC = () => {
               </div>
             )}
 
-            <div className="rounded-[2rem] border border-slate-100 bg-slate-50 p-5 shadow-sm dark:border-slate-700 dark:bg-slate-700/40">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Proveedor y Orden</p>
-              <p className="mt-2 text-lg font-black text-slate-900 dark:text-slate-100">{selectedInboundOrder?.ProviderName || 'Proveedor'}</p>
-              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">PO: {selectedInboundOrder?.PONumber || 'Sin PO'}</p>
-              {selectedInboundOrder?.LotReceiveID ? (
-                <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Lote: {selectedInboundOrder.LotReceiveID}{selectedInboundOrder.LotInventoryID ? ` • Inventario ${selectedInboundOrder.LotInventoryID}` : ''}</p>
-              ) : null}
-            </div>
-
-            {inboundSummary && (
-              <div className="grid gap-3 sm:grid-cols-3">
-                <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Esperado</p>
-                  <p className="mt-2 text-2xl font-black text-slate-900 dark:text-slate-100">{inboundSummary.totalExpected}</p>
-                </div>
-                <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Escaneado</p>
-                  <p className="mt-2 text-2xl font-black text-blue-600 dark:text-blue-400">{totalScannedPieces}</p>
-                </div>
-                <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Restante</p>
-                  <p className="mt-2 text-2xl font-black text-slate-900 dark:text-slate-100">{totalRemainingToScanPieces}</p>
-                </div>
+            {detailLoading ? (
+              <div className="flex items-center justify-center py-8 text-slate-500">
+                <LoaderCircle className="mr-2 animate-spin" size={18} />
+                Cargando detalle...
               </div>
-            )}
-
-            <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Artículos a recibir</p>
-              {selectedInboundDetails.length === 0 ? (
-                <p className="mt-2 text-sm text-slate-500 dark:text-slate-300">Aún no hay líneas para esta orden.</p>
-              ) : (
-                <div className="mt-4 space-y-3">
-                  {selectedInboundDetails.map((item) => {
-                    const scanned = scannedCounts[item.PurchaseOrderDetailID] || 0;
-                    const expected = Number(item.Qty || 0);
-                    const received = Number(item.ReceivedQty || 0);
-                    const remaining = Math.max(0, expected - received - scanned);
-                    const isComplete = remaining === 0 && scanned > 0;
-
-                    return (
-                      <div
-                        key={item.PurchaseOrderDetailID}
-                        className={`rounded-2xl border p-4 transition-all ${
-                          isComplete
-                            ? 'border-emerald-200 bg-emerald-50 dark:border-emerald-900/40 dark:bg-emerald-900/20'
-                            : 'border-slate-100 bg-slate-50/70 dark:border-slate-700 dark:bg-slate-700/40'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">
-                              {item.PartNumber || item.ItemID}
-                            </p>
-                            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{item.PartName || 'Sin descripción'}</p>
-                            <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
-                              Área: {item.WorkArea || 'Sin área'} | Medida: {item.MeasureDescription || 'Unidad'}
-                            </p>
-                          </div>
-                          <div className="text-right">
-                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Escaneado</p>
-                            <p className="mt-1 text-2xl font-black text-blue-600 dark:text-blue-400">{scanned}</p>
-                            <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">Restante: {remaining}</p>
-                          </div>
-                        </div>
-
-                        {!isReadonlyInboundOrder && remaining > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => handleScanPiece(item)}
-                            className="mt-3 w-full rounded-xl border-2 border-blue-500 bg-blue-50 py-2 text-sm font-black uppercase tracking-widest text-blue-600 transition-all active:scale-95 dark:bg-blue-900/20 dark:text-blue-400"
-                          >
-                            <Scan size={16} className="mb-1 inline mr-2" />
-                            Escanear (+1)
-                          </button>
-                        )}
-
-                        {isComplete && (
-                          <div className="mt-3 flex items-center gap-2 rounded-xl border-2 border-emerald-500 bg-emerald-50 py-2 px-3 dark:border-emerald-900/50 dark:bg-emerald-900/20">
-                            <Check size={16} className="text-emerald-600 dark:text-emerald-400" />
-                            <span className="text-sm font-black text-emerald-600 dark:text-emerald-400">Completo</span>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+            ) : (
+              <>
+                <div className="rounded-[2rem] border border-slate-100 bg-slate-50 p-5 shadow-sm dark:border-slate-700 dark:bg-slate-700/40">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Proveedor y Orden</p>
+                  <p className="mt-2 text-lg font-black text-slate-900 dark:text-slate-100">{selectedInboundOrder?.ProviderName || 'Proveedor'}</p>
+                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">PO: {selectedInboundOrder?.PONumber || 'Sin PO'}</p>
+                  {selectedInboundOrder?.LotReceiveID ? (
+                    <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Lote: {selectedInboundOrder.LotReceiveID}{selectedInboundOrder.LotInventoryID ? ` • Inventario ${selectedInboundOrder.LotInventoryID}` : ''}</p>
+                  ) : null}
                 </div>
-              )}
-            </div>
 
-            {!isReadonlyInboundOrder && totalScannedPieces > 0 && (
-              <button
-                type="button"
-                onClick={handleOpenQuarantineModal}
-                disabled={confirming}
-                className="w-full rounded-2xl bg-slate-900 px-4 py-4 text-sm font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-60 dark:bg-slate-800"
-              >
-                {confirming ? 'Procesando...' : `Confirmar recepción (${totalScannedPieces} piezas)`}
-              </button>
-            )}
-            {isReadonlyInboundOrder && (
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-300">
-                Esta orden está en estado {selectedInboundStatusId} y solo puedes revisar sus detalles. La interacción real se hace desde el escaneo del lote.
-              </div>
-            )}
-
-            {showQuarantineModal && (
-              <div className="fixed inset-0 z-[110] bg-slate-950/80 p-3 sm:p-6">
-                <div className="mx-auto max-w-3xl overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
-                  <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-700 dark:bg-slate-800/70">
-                    <div>
-                      <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Confirmar recepción</p>
-                      <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Selecciona la ubicación de rack de destino</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setShowQuarantineModal(false)}
-                      className="rounded-full p-2 text-slate-600 transition hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-700"
-                    >
-                      <X size={20} />
-                    </button>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Estado</p>
+                    <p className="mt-2 text-sm font-black text-slate-900 dark:text-slate-100">
+                      {(selectedInboundOrder as any)?.StatusDescription || (selectedInboundStatusId === 42 ? 'Ejecutada' : selectedInboundStatusId === 41 ? 'Aprobada' : 'Pendiente')}
+                    </p>
                   </div>
+                  <div className="rounded-[2rem] border border-slate-100 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Cantidad</p>
+                    <p className="mt-2 text-sm font-black text-slate-900 dark:text-slate-100">{selectedInboundOrder?.Quantity ?? selectedInboundOrder?.orderedQty ?? 0}</p>
+                  </div>
+                </div>
 
-                  <div className="space-y-4 p-4 sm:p-6">
-                    {selectedLot ? (
-                      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm dark:border-slate-700 dark:bg-slate-800/50">
-                        <div className="font-black uppercase tracking-[0.2em] text-slate-400 dark:text-slate-300">Lote actual</div>
-                        <div className="mt-2 text-slate-900 dark:text-slate-100">
-                          {selectedLot.InternalLot || selectedLot.ProviderLot || selectedLot.ShortInternalLot || `#${selectedLot.LotReceiveID || selectedLot.ReceiveID || 'n/a'}`}
-                        </div>
-                        <div className="mt-1 text-slate-600 dark:text-slate-400">
-                          Ubicación actual: {selectedLot.CurrentLocationID ? String(selectedLot.CurrentLocationID) : 'Sin ubicación registrada'}
-                        </div>
-                      </div>
+                <div className="rounded-[2rem] border border-slate-100 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Artículo</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-800 dark:text-slate-100">
+                    {selectedInboundOrder?.PartNumber || 'Sin producto'}{selectedInboundOrder?.PartName ? ` - ${selectedInboundOrder.PartName}` : ''}
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    {(selectedInboundOrder as any)?.SourceLocationName ? (
+                      <span className="rounded-full bg-blue-50 px-2.5 py-1 font-semibold text-blue-700 dark:bg-blue-500/10 dark:text-blue-300">Origen: {(selectedInboundOrder as any).SourceLocationName}</span>
                     ) : null}
-
-                    <div>
-                      <label className="block">
-                        <span className="text-xs font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Rack de destino</span>
-                        <input
-                          type="text"
-                          value={rackCodeInput}
-                          onChange={(e) => handleRackCodeChange(e.target.value)}
-                          placeholder="Ej.: A-01-02"
-                          className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
-                        />
-                      </label>
-
-                      <div className="mt-3 flex items-center justify-between">
-                        <p className="text-sm font-black text-slate-900 dark:text-slate-100">Catálogo de ubicaciones disponibles</p>
-                        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{storageLocations.length} ubicaciones</span>
-                      </div>
-                      {loadingStorageLocations ? (
-                        <div className="py-8 text-center text-slate-500">Cargando ubicaciones...</div>
-                      ) : storageLocations.length === 0 ? (
-                        <div className="py-8 text-center text-slate-500">No hay ubicaciones de rack disponibles.</div>
-                      ) : (
-                        <div className="grid gap-2 max-h-80 overflow-y-auto pt-3">
-                          {storageLocations.map((loc) => {
-                            const locationCode = getStorageLocationCode(loc);
-                            const isSelected = selectedStorageLocation?.StorageID === loc.StorageID;
-                            return (
-                              <button
-                                key={loc.StorageID}
-                                type="button"
-                                onClick={() => {
-                                  setSelectedStorageLocation(loc);
-                                  setDestinationLocationId(String(loc.StorageID ?? loc.LocationID ?? ''));
-                                  setRackCodeInput(locationCode);
-                                }}
-                                className={`w-full rounded-2xl border p-4 text-left transition ${isSelected ? 'border-blue-600 bg-blue-50 text-slate-900 dark:border-blue-400 dark:bg-blue-900/30 dark:text-white' : 'border-slate-200 bg-slate-50 text-slate-900 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-100'}`}
-                              >
-                                <div className="font-bold">{locationCode}</div>
-                                <div className="mt-1 text-sm opacity-80">
-                                  {loc.LocationName ? `${loc.LocationName} • ` : ''}Col {loc.RackColumn} - Cel {loc.RackCell}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
-                      <button
-                        type="button"
-                        onClick={handleConfirmOrder}
-                        disabled={confirming || !selectedStorageLocation}
-                        className="w-full rounded-2xl bg-slate-900 px-4 py-4 text-sm font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-60 dark:bg-slate-800 sm:w-auto"
-                      >
-                        {confirming ? 'Procesando...' : 'Confirmar recepción'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setShowQuarantineModal(false)}
-                        className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-4 text-sm font-black uppercase tracking-widest text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 sm:w-auto"
-                      >
-                        Cancelar
-                      </button>
-                    </div>
+                    {(selectedInboundOrder as any)?.DestinationLocationName ? (
+                      <span className="rounded-full bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">Destino: {(selectedInboundOrder as any).DestinationLocationName}</span>
+                    ) : null}
                   </div>
                 </div>
-              </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-300">
+                  Esta es una vista de solo lectura. La transferencia al rack se completa desde el módulo de Transferencias una vez que el MES Web aprueba la solicitud.
+                </div>
+              </>
             )}
           </div>
         </div>

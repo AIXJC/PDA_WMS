@@ -88,6 +88,7 @@ app.use("/api", (req, res, next) => {
   // if (req.method === 'POST' && /^\/requests\/inbound\/\d+\/confirm$/.test(req.path)) return next();
   if (req.method === 'PUT' && /^\/requests\/\d+$/.test(req.path)) return next();
   if (req.method === 'POST' && /^\/requests\/\d+\/execute-transfer$/.test(req.path)) return next();
+  if (req.method === 'POST' && /^\/requests\/\d+\/complete-storage-transfer$/.test(req.path)) return next();
   if (req.method === 'POST' && req.path === '/erp/create-stock-entry') return next();
   if (req.method === 'PUT' && req.path === '/erp/submit-stock-entry') return next();
 
@@ -3782,6 +3783,34 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     return res.status(400).json({ message: "Una transferencia requiere ubicación de origen y destino." });
   }
 
+  // Las transferencias que salen de Incoming (recepción) siempre deben mover el lote
+  // completo — no se permiten transferencias parciales desde esa ubicación.
+  let effectiveQty = parsedQty;
+  let isIncomingSourceTransfer = false;
+  if (isTransfer && normalizedSourceLocationId) {
+    const [sourceLocRows] = await pool.query(
+      "SELECT LocationName FROM PLANT_LOCATIONS WHERE LocationID = ? LIMIT 1",
+      [normalizedSourceLocationId]
+    );
+    const sourceLocationName = String(sourceLocRows[0]?.LocationName || '').toLowerCase();
+    isIncomingSourceTransfer = sourceLocationName.includes('incoming');
+
+    if (isIncomingSourceTransfer) {
+      if (!Number.isInteger(resolvedLotInventoryId) || resolvedLotInventoryId <= 0) {
+        return res.status(400).json({ message: "Una transferencia desde Incoming requiere un lote de inventario válido." });
+      }
+      const [lotQtyRows] = await pool.query(
+        "SELECT CurrentQuantity FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1",
+        [resolvedLotInventoryId]
+      );
+      const lotFullQuantity = Number(lotQtyRows[0]?.CurrentQuantity || 0);
+      if (!(lotFullQuantity > 0)) {
+        return res.status(409).json({ message: "El lote no tiene cantidad disponible para transferir." });
+      }
+      effectiveQty = lotFullQuantity;
+    }
+  }
+
   // El ERP valida el request_id releyendo la fila desde la misma base de datos con su
   // propia conexión, así que el INSERT debe quedar comprometido (COMMIT) ANTES de
   // llamarlo — de lo contrario el ERP no puede ver una fila todavía no confirmada y
@@ -3796,7 +3825,7 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
   `, [
     parsedTypeId,
     normalizedPartNumber,
-    parsedQty,
+    effectiveQty,
     parsedRegUserId,
     parsedRegUserId,
     normalizedSourceLocationId,
@@ -3810,6 +3839,10 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
   if (isTransfer) {
     erpResult = await erpClient.createStockEntry(requestId);
     if (!erpResult.ok) {
+      console.error(
+        `[POST /api/requests] ERP rechazó requestId=${requestId} vía createStockEntry: status=${erpResult.status} message=${erpResult.message}`,
+        erpResult.data
+      );
       await pool.query("DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
       return res.status(502).json({
         message: `La solicitud no se creó porque el MES Web la rechazó: ${erpResult.message}`,
@@ -4172,6 +4205,245 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
 });
 
 app.post("/api/requests/:id(\\d+)/execute-transfer", handleExecuteTransfer);
+
+// Revierte lo hecho por completeStorageTransfer cuando la confirmación (URL 2) o el
+// mapa visual de racks (URL 3) fallan después de que MES_DB ya quedó comprometido.
+async function reverseStorageTransferCompletion(connection, { requestId, lotInventoryId, sourceLocationId, storageId, partNumber }) {
+  const [movementRows] = await connection.query(
+    'SELECT MovementID, Quantity FROM INVENTORY_MOVEMENTS_HISTORY WHERE RequestID = ? ORDER BY MovementID DESC LIMIT 1 FOR UPDATE',
+    [requestId]
+  );
+  const movement = movementRows[0];
+  if (!movement) return { reversed: false, reason: 'movement_not_found' };
+
+  const quantity = Number(movement.Quantity || 0);
+
+  await connection.query(
+    'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
+    [sourceLocationId, lotInventoryId]
+  );
+
+  const [inventoryRows] = await connection.query(
+    'SELECT InventoryID FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? LIMIT 1',
+    [partNumber, storageId]
+  );
+  if (inventoryRows[0]) {
+    await connection.query(
+      'UPDATE MES_INVENTORY SET Quantity = Quantity - ?, LastUpdate = NOW() WHERE InventoryID = ?',
+      [quantity, inventoryRows[0].InventoryID]
+    );
+  }
+
+  await connection.query('DELETE FROM INVENTORY_MOVEMENTS_HISTORY WHERE MovementID = ?', [movement.MovementID]);
+  await connection.query(
+    'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, SubmitDate = NULL WHERE RequestID = ?',
+    [requestId]
+  );
+
+  return { reversed: true, movementId: movement.MovementID, quantity };
+}
+
+// Paso final del flujo Incoming -> Storage: el operador ya movió físicamente el lote
+// completo al rack elegido y confirma. Actualiza MES_DB (ubicación del lote, inventario
+// del rack, historial de movimientos, estado 42) en una transacción local; una vez
+// comprometida, confirma la cantidad con el ERP (URL 2) y actualiza el mapa visual de
+// racks (URL 3). Si cualquiera de las dos llamadas al ERP falla, se revierte todo con
+// una transacción compensatoria (mismo patrón que handleExecuteTransfer/reverseSubmittedMovement,
+// necesario porque el ERP relee esta misma fila con su propia conexión y no se puede
+// mantener una transacción de MySQL abierta mientras se espera una llamada HTTP externa).
+app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (req, res) => {
+  const requestId = Number(req.params.id);
+  if (!Number.isInteger(requestId)) {
+    return res.status(400).json({ message: "Identificador de solicitud inválido." });
+  }
+
+  const { storageId, regUserId } = req.body || {};
+  const parsedStorageId = Number(storageId);
+  const parsedUserId = regUserId ? Number(regUserId) : null;
+  if (!Number.isInteger(parsedStorageId) || parsedStorageId <= 0) {
+    return res.status(400).json({ message: "Debe seleccionar una ubicación de rack." });
+  }
+
+  const [requestRows] = await pool.query("SELECT * FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
+  const requestRow = requestRows[0];
+  if (!requestRow) {
+    return res.status(404).json({ message: "La solicitud no existe." });
+  }
+  if (Number(requestRow.RequestTypeID) !== 2) {
+    return res.status(409).json({ message: "Esta operación solo aplica a solicitudes de Transferencia." });
+  }
+  if (Number(requestRow.RequestStatusID) !== 41) {
+    return res.status(409).json({ message: "La solicitud debe estar aprobada por el MES Web antes de completar la transferencia." });
+  }
+  if (!requestRow.LotInventoryID) {
+    return res.status(400).json({ message: "La solicitud no tiene un lote de inventario asociado." });
+  }
+
+  const [locationRows] = await pool.query(
+    `SELECT src.LocationName AS SourceLocationName, dest.LocationName AS DestinationLocationName
+     FROM INVENTORY_REQUESTS req
+     LEFT JOIN PLANT_LOCATIONS src ON src.LocationID = req.SourceLocationID
+     LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
+     WHERE req.RequestID = ? LIMIT 1`,
+    [requestId]
+  );
+  const sourceLocationName = String(locationRows[0]?.SourceLocationName || '').toLowerCase();
+  const destinationLocationName = String(locationRows[0]?.DestinationLocationName || '').toLowerCase();
+  if (!sourceLocationName.includes('incoming') || !/stor|almac/.test(destinationLocationName)) {
+    return res.status(409).json({ message: "Esta operación solo aplica a transferencias de Incoming a Storage." });
+  }
+
+  const [storageRows] = await pool.query("SELECT StorageID FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1", [parsedStorageId]);
+  if (!storageRows[0]) {
+    return res.status(404).json({ message: "La ubicación de rack indicada no existe." });
+  }
+
+  const partNumber = String(requestRow.PartNumber || '').trim();
+  const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
+  const lotInventoryId = Number(requestRow.LotInventoryID);
+
+  let quantity = 0;
+  let lotInternalLot = null;
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [lotRows] = await connection.query(
+      'SELECT CurrentQuantity, CurrentLocationID, CurrentInternalLot FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
+      [lotInventoryId]
+    );
+    const lotRow = lotRows[0];
+    if (!lotRow) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'El lote de inventario asociado no fue encontrado.' });
+    }
+    if (sourceLocationId != null && lotRow.CurrentLocationID != null && Number(lotRow.CurrentLocationID) !== sourceLocationId) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El lote ya no está en Incoming; no se puede completar la transferencia.' });
+    }
+    quantity = Number(lotRow.CurrentQuantity || 0);
+    lotInternalLot = lotRow.CurrentInternalLot || null;
+    if (!(quantity > 0)) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El lote no tiene cantidad disponible para transferir.' });
+    }
+
+    await connection.query(
+      'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
+      [CYCLIC_COUNT_STORAGE_LOCATION_ID, lotInventoryId]
+    );
+
+    const [existingInventoryRows] = await connection.query(
+      'SELECT InventoryID FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? FOR UPDATE',
+      [partNumber, parsedStorageId]
+    );
+    if (existingInventoryRows[0]) {
+      await connection.query(
+        'UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?',
+        [quantity, existingInventoryRows[0].InventoryID]
+      );
+    } else {
+      await connection.query(
+        'INSERT INTO MES_INVENTORY (PartNumber, RackLocationID, Quantity, LastUpdate) VALUES (?, ?, ?, NOW())',
+        [partNumber, parsedStorageId, quantity]
+      );
+    }
+
+    await connection.query(`
+      INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
+        RequestID, PartNumber, StorageID, Quantity, MovementTypeID,
+        SourceLocationID, DestinationLocationID, RegUserID, ConfirmUserID,
+        Comments, OriginalInternalLot, NewInternalLot
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      requestId,
+      partNumber,
+      parsedStorageId,
+      quantity,
+      2,
+      sourceLocationId,
+      CYCLIC_COUNT_STORAGE_LOCATION_ID,
+      parsedUserId || requestRow.RegUserID,
+      parsedUserId || requestRow.RegUserID,
+      'Transferencia Incoming → Storage completada',
+      lotInternalLot,
+      lotInternalLot,
+    ]);
+
+    await connection.query(
+      'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 42, ConfirmUserID = ?, SubmitDate = NOW() WHERE RequestID = ?',
+      [parsedUserId || requestRow.RegUserID, requestId]
+    );
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    console.error(`[complete-storage-transfer] ERROR requestId=${requestId}:`, error);
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  let erpConfirmResult = null;
+  let erpRackResult = null;
+
+  try {
+    erpConfirmResult = await erpClient.submitStockEntry({
+      requestId,
+      qty: quantity,
+      batchNo: lotInternalLot || undefined,
+    });
+    if (!erpConfirmResult.ok) {
+      throw Object.assign(new Error('confirm_rejected'), { erpDetail: erpConfirmResult });
+    }
+
+    erpRackResult = await erpClient.storeMaterialInRack({
+      storageId: parsedStorageId,
+      partNumber,
+      batch: lotInternalLot || '',
+      quantity,
+    });
+    if (!erpRackResult.ok) {
+      throw Object.assign(new Error('rack_map_rejected'), { erpDetail: erpRackResult });
+    }
+  } catch (erpError) {
+    console.error(`[complete-storage-transfer] MES Web rechazó la operación para requestId=${requestId}:`, erpError.erpDetail || erpError);
+
+    const compConnection = await pool.getConnection();
+    let compensation = { reversed: false, reason: 'not_attempted' };
+    try {
+      await compConnection.beginTransaction();
+      compensation = await reverseStorageTransferCompletion(compConnection, {
+        requestId,
+        lotInventoryId,
+        sourceLocationId,
+        storageId: parsedStorageId,
+        partNumber,
+      });
+      await compConnection.commit();
+    } catch (compensationError) {
+      await compConnection.rollback().catch(() => {});
+      console.error(`[complete-storage-transfer] Falló la reversión compensatoria para requestId=${requestId}:`, compensationError);
+      compensation = { reversed: false, reason: 'compensation_failed' };
+    } finally {
+      compConnection.release();
+    }
+
+    console.error(`[complete-storage-transfer] requestId=${requestId} revertido=${compensation.reversed} razon=${compensation.reason || 'n/a'}`);
+    return res.status(502).json({ message: 'No se pudo completar la transferencia al rack, intenta de nuevo.' });
+  }
+
+  res.json({
+    ok: true,
+    requestId,
+    storageId: parsedStorageId,
+    quantity,
+    erpConfirm: erpConfirmResult.data,
+    erpRack: erpRackResult.data,
+    message: 'Transferencia a rack completada correctamente.',
+  });
+}));
 
 app.get("/api/reports/summary", asyncRoute(async (_req, res) => {
   const [
