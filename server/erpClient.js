@@ -15,6 +15,23 @@ if (fs.existsSync(envPath)) {
 
 const REQUEST_TIMEOUT_MS = Number(process.env.ERP_REQUEST_TIMEOUT_MS || 10000);
 
+// Cuando el ERP responde con una página de error HTML (p.ej. el debugger de
+// Werkzeug/Frappe en un 500) en vez de JSON, intenta rescatar el nombre y
+// mensaje de la excepción real para que el log diga algo útil en vez de
+// "El ERP respondió 500".
+function extractHtmlErrorSnippet(rawText) {
+  if (!rawText) return null;
+  const titleMatch = rawText.match(/<h1>(.*?)<\/h1>/is);
+  const errorMsgMatch = rawText.match(/class="errormsg">(.*?)<\/p>/is);
+  const strip = (value) => value.replace(/<[^>]+>/g, '').trim();
+  const parts = [
+    titleMatch ? strip(titleMatch[1]) : null,
+    errorMsgMatch ? strip(errorMsgMatch[1]) : null,
+  ].filter(Boolean);
+  if (parts.length) return parts.join(': ');
+  return rawText.slice(0, 300).replace(/\s+/g, ' ').trim() || null;
+}
+
 // Endpoints de mes_integration.api.mes.stock_entry.* : cuerpo JSON, códigos HTTP
 // estándar (200/400/404/409/500) para indicar éxito/error.
 async function callErpJson(url, method, body) {
@@ -37,11 +54,12 @@ async function callErpJson(url, method, body) {
       signal: controller.signal,
     });
 
+    const rawText = await response.text();
     let data = null;
     try {
-      data = await response.json();
+      data = rawText ? JSON.parse(rawText) : null;
     } catch {
-      // Non-JSON response body; keep data as null.
+      // Non-JSON response body (p.ej. página de error HTML); data queda null.
     }
 
     if (!response.ok) {
@@ -49,7 +67,7 @@ async function callErpJson(url, method, body) {
         ok: false,
         status: response.status,
         data,
-        message: data?.message || data?.exception || `El ERP respondió ${response.status}`,
+        message: data?.message || data?.exception || extractHtmlErrorSnippet(rawText) || `El ERP respondió ${response.status}`,
       };
     }
 
