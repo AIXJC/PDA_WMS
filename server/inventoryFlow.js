@@ -10,6 +10,13 @@ function shouldApplyInventoryUpdate(requestStatusId, requestTypeId, lotInventory
   return true;
 }
 
+// Una solicitud solo puede ejecutarse (pasar de aprobada a confirmada) una
+// vez. Si ya está en 42 no debe volver a entrar al flujo: eso es lo que
+// permitía la doble ejecución que revertía un 42 legítimo de vuelta a 41.
+function canExecuteTransfer(requestStatusId) {
+  return Number(requestStatusId) === 41;
+}
+
 function getInventoryDelta(requestStatusId) {
   const statusId = Number(requestStatusId);
   if (statusId === 41) return 1;
@@ -24,6 +31,20 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
     return { applied: false, reason: 'status_not_applicable' };
   }
 
+  // Idempotencia: si ya existe un movimiento registrado para este RequestID,
+  // no lo volvemos a aplicar. Sin esto, una segunda invocación accidental
+  // (llamador duplicado, reintento, etc.) descontaría/sumaría inventario dos
+  // veces y volvería a someter el movimiento al ERP, que lo rechazaría por
+  // duplicado y dispararía una reversión que deshace el resultado correcto
+  // de la primera ejecución.
+  const [existingMovementRows] = await connection.query(
+    'SELECT MovementID FROM INVENTORY_MOVEMENTS_HISTORY WHERE RequestID = ? AND MovementTypeID = 2 LIMIT 1',
+    [requestId]
+  );
+  if (existingMovementRows[0]) {
+    return { applied: false, reason: 'already_applied', movementId: existingMovementRows[0].MovementID };
+  }
+
   const [lotRows] = await connection.query(
     'SELECT LotInventoryID, InventoryID, CurrentQuantity, CurrentLocationID, CurrentInternalLot FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1',
     [lotId]
@@ -33,9 +54,22 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
 
   const normalizedPartNumber = String(partNumber || '').trim();
   const parsedQty = Number(quantity);
-  const quantityToApply = Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : Number(lotRow.CurrentQuantity || 0);
-  const delta = getInventoryDelta(requestStatusId);
-  const signedQuantity = delta !== 0 ? quantityToApply * delta : quantityToApply;
+  let quantityToApply = Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : Number(lotRow.CurrentQuantity || 0);
+  
+  // ========== CAMBIO AQUÍ ==========
+  // Calcular delta según tipo de solicitud
+  let delta = 0;
+  if (requestStatusId === 42) {
+    // Restan: Consumo (3), Scrap (6), Transferencia parcial (12)
+    if ([3, 6, 12].includes(requestTypeId)) {
+      delta = -1;
+    } else {
+      delta = 0; // Transferencia (2), Ajuste (7), Devolución (8) NO restan
+    }
+  } 
+  
+  const signedQuantity = delta !== 0 ? quantityToApply * delta : 0;
+  // ========== FIN CAMBIO ==========
 
   let inventoryId = lotRow.InventoryID != null ? Number(lotRow.InventoryID) : null;
   if (!inventoryId) {
@@ -46,7 +80,6 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
     inventoryId = inventoryRows[0]?.InventoryID != null ? Number(inventoryRows[0].InventoryID) : null;
   }
 
-  // MES_INVENTORY.RackLocationID es NOT NULL, así que necesitamos un valor válido sí o sí.
   const rackLocationId = destinationLocationId || sourceLocationId || null;
   if (!inventoryId && !rackLocationId) {
     throw new Error(`No se pudo determinar RackLocationID para crear MES_INVENTORY (PartNumber=${normalizedPartNumber}).`);
@@ -70,10 +103,6 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
     [inventoryId, signedQuantity, rackLocationId, lotId]
   );
 
-  // INVENTORY_MOVEMENTS_HISTORY tiene SourceLocationID, DestinationLocationID, RegUserID y
-  // ConfirmUserID como NOT NULL. Si falta cualquiera, fallamos con un mensaje claro
-  // en vez de dejar que MySQL reviente con un error críptico que además hace rollback
-  // silencioso de todo (incluido el cambio de status 41->42).
   const safeSourceLocationId = sourceLocationId || destinationLocationId || null;
   const safeDestinationLocationId = destinationLocationId || sourceLocationId || null;
   const safeUserId = userId || null;
@@ -183,4 +212,4 @@ async function getStorageFromLot(connection, requestId) {
   return rows[0] || null;
 }
 
-export { shouldApplyInventoryUpdate, getInventoryDelta, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot };
+export { shouldApplyInventoryUpdate, canExecuteTransfer, getInventoryDelta, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot };

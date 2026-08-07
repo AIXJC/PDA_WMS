@@ -8,7 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import * as erpClient from "./erpClient.js";
 import { buildInboundTransferRequestPayload } from './receiptFlow.js';
-import { shouldApplyInventoryUpdate, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot } from './inventoryFlow.js';
+import { shouldApplyInventoryUpdate, canExecuteTransfer, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot } from './inventoryFlow.js';
 
 dotenv.config({ path: "server/.env" });
 dotenv.config();
@@ -3925,9 +3925,8 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
   if (![2, 3, 6, 12].includes(Number(requestRow.RequestTypeID))) {
     return res.status(409).json({ message: "Esta operación solo aplica a solicitudes de Transferencia, Consumo, Transferencia parcial o Scrap." });
   }
-  const allowedStatuses = new Set([41, 42]);
-  if (!allowedStatuses.has(Number(requestRow.RequestStatusID))) {
-    return res.status(409).json({ message: "La solicitud debe estar aprobada o confirmada antes de ejecutar la transferencia." });
+  if (!canExecuteTransfer(requestRow.RequestStatusID)) {
+    return res.status(409).json({ message: "La solicitud debe estar aprobada (41) antes de ejecutar la transferencia." });
   }
 
   const effectiveDestinationLocationId = Number(requestRow.DestinationLocationID || parsedDestinationLocationId || null) || null;
@@ -3963,6 +3962,26 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+
+    // Bloquea la fila de la solicitud y vuelve a leer su estado dentro de la
+    // transacción: el SELECT inicial (línea arriba) se hizo con pool.query,
+    // fuera de cualquier lock, así que entre ese SELECT y este punto otra
+    // llamada (doble clic, reintento de red, etc.) pudo haber ejecutado ya
+    // esta misma solicitud. Si el estado ya no es 41, abortamos en vez de
+    // volver a aplicar el movimiento y re-someter al ERP.
+    const [statusLockRows] = await connection.query(
+      'SELECT RequestStatusID FROM INVENTORY_REQUESTS WHERE RequestID = ? FOR UPDATE',
+      [requestId]
+    );
+    const lockedStatusId = statusLockRows[0] ? Number(statusLockRows[0].RequestStatusID) : null;
+    if (!canExecuteTransfer(lockedStatusId)) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: lockedStatusId === 42
+          ? 'La solicitud ya fue ejecutada anteriormente.'
+          : 'La solicitud ya no está en estado aprobado (41).',
+      });
+    }
 
     if (!requestRow.LotInventoryID) {
       await connection.rollback();
