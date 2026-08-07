@@ -235,7 +235,9 @@ export const Transfers: React.FC = () => {
     try {
       setExecuting(currentRequest.RequestID);
 
-      // 1. Ejecutar transferencia en MES
+      // Ejecuta la transferencia y confirma el movimiento en MES Web en una
+      // sola operación atómica: si cualquier parte falla, el backend revierte
+      // todo y la solicitud queda intacta en su estado anterior.
       const r = await fetch(
         `/api/requests/${currentRequest.RequestID}/execute-transfer`,
         {
@@ -260,30 +262,6 @@ export const Transfers: React.FC = () => {
         );
       }
 
-      // 2. Confirmar movimiento en ERP
-      const responseERP = await fetch('/api/erp/submit-stock-entry', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          request_id: currentRequest.RequestID,
-          request_type_id: currentRequest.RequestTypeID,
-          qty: parsedQuantity,
-          batch_no:
-            lotTraceabilityByRequest[currentRequest.RequestID]?.InternalLot,
-        }),
-      });
-
-      const dataERP = await responseERP.json();
-
-      if (!responseERP.ok) {
-        throw new Error(
-          dataERP.message || 'Error al actualizar el movimiento en ERP'
-        );
-      }
-
-      // 3. Refrescar interfaz
       setShowStorageModal(false);
       notifyAppRefresh('action');
       await load(false);

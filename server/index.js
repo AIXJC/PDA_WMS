@@ -2366,6 +2366,12 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
 
   const connection = await pool.getConnection();
 
+  let requestRow = null;
+  let movementResult = null;
+  let scrapResult = null;
+  let newScrapRequestId = null;
+  let availableQty = 0;
+
   try {
     await connection.beginTransaction();
 
@@ -2389,7 +2395,7 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       LIMIT 1
     `, [requestId]);
 
-    const requestRow = requestRows[0];
+    requestRow = requestRows[0];
 
     if (!requestRow) {
       await connection.rollback();
@@ -2496,7 +2502,7 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       }
     }
 
-    const availableQty = Number(lotRow.CurrentQuantity || 0);
+    availableQty = Number(lotRow.CurrentQuantity || 0);
 
     if (availableQty <= 0) {
       await connection.rollback();
@@ -2541,7 +2547,7 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
     const movementComments =
       `${normalizedScrapType}${normalizedComments ? ` | ${normalizedComments}` : ''}`;
 
-    const [movementResult] = await connection.query(`
+    [movementResult] = await connection.query(`
       INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
         RequestID,
         PartNumber,
@@ -2572,7 +2578,7 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       'SCRAP'
     ]);
 
-    const [scrapResult] = await connection.query(`
+    [scrapResult] = await connection.query(`
       INSERT INTO MES_SCRAP_AND_DISCREPANCIES (
         PartNumber,
         Quantity,
@@ -2590,8 +2596,6 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       movementComments,
       movementResult.insertId
     ]);
-
-    let newScrapRequestId = null;
 
     if (!isScrapRequest) {
       const [scrapLocationRows] = await connection.query(`
@@ -2666,24 +2670,73 @@ app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
       requestId
     ]);
 
+    // Commit de todos los cambios locales ANTES de llamar al ERP: el ERP
+    // escribe esta misma fila (INVENTORY_REQUESTS) con su propia conexión,
+    // así que llamarlo con esta transacción todavía abierta produciría un
+    // interbloqueo (su UPDATE esperando el lock que esta llamada retiene).
     await connection.commit();
-
-    res.status(201).json({
-      ok: true,
-      requestId,
-      movementId: movementResult.insertId,
-      scrapId: scrapResult.insertId,
-      newScrapRequestId,
-      deductedQty: parsedQty,
-      remainingLotQuantity: availableQty - parsedQty
-    });
-
   } catch (error) {
-    await connection.rollback();
+    await connection.rollback().catch(() => {});
     throw error;
   } finally {
     connection.release();
   }
+
+  const erpSubmitResult = await erpClient.submitEntryForRequestType({
+    requestId,
+    requestTypeId: Number(requestRow.RequestTypeID),
+    qty: parsedQty,
+    batchNo: requestRow.CurrentInternalLot || undefined,
+  });
+
+  if (!erpSubmitResult.ok) {
+    console.error(`[scrap] MES Web rechazó la confirmación del movimiento para requestId=${requestId}:`, erpSubmitResult);
+
+    const compConnection = await pool.getConnection();
+    let compensation = { reversed: false, reason: 'not_attempted' };
+    try {
+      await compConnection.beginTransaction();
+      compensation = await reverseSubmittedMovement(compConnection, {
+        requestId,
+        requestTypeId: Number(requestRow.RequestTypeID),
+        lotInventoryId: requestRow.LotInventoryID,
+        sourceLocationId: requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null,
+      });
+      if (compensation.reversed) {
+        await compConnection.query(
+          "UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, SubmitDate = NULL WHERE RequestID = ?",
+          [requestId]
+        );
+      }
+      if (newScrapRequestId) {
+        await compConnection.query(
+          'DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ? AND RequestStatusID = 40',
+          [newScrapRequestId]
+        );
+      }
+      await compConnection.commit();
+    } catch (compensationError) {
+      await compConnection.rollback().catch(() => {});
+      console.error(`[scrap] Falló la reversión compensatoria para requestId=${requestId}:`, compensationError);
+      compensation = { reversed: false, reason: 'compensation_failed' };
+    } finally {
+      compConnection.release();
+    }
+
+    console.error(`[scrap] requestId=${requestId} revertido=${compensation.reversed} razon=${compensation.reason || 'n/a'}`);
+    return res.status(502).json({ message: 'No se pudo completar la operación, intenta de nuevo.' });
+  }
+
+  res.status(201).json({
+    ok: true,
+    requestId,
+    movementId: movementResult.insertId,
+    scrapId: scrapResult.insertId,
+    newScrapRequestId,
+    deductedQty: parsedQty,
+    remainingLotQuantity: availableQty - parsedQty,
+    erpSubmit: erpSubmitResult.data,
+  });
 }));
 
 app.get("/api/scrap", asyncRoute(async (req, res) => {
@@ -3759,7 +3812,7 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     if (!erpResult.ok) {
       await pool.query("DELETE FROM INVENTORY_REQUESTS WHERE RequestID = ?", [requestId]);
       return res.status(502).json({
-        message: `La solicitud no se creó porque el ERP la rechazó: ${erpResult.message}`,
+        message: `La solicitud no se creó porque el MES Web la rechazó: ${erpResult.message}`,
         erp: erpResult,
       });
     }
@@ -3772,7 +3825,7 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
       ? { stockEntry: erpResult.data?.stock_entry, stockEntryType: erpResult.data?.stock_entry_type, message: erpResult.message }
       : null,
     message: isTransfer
-      ? `Solicitud #${requestId} creada y sincronizada con el ERP correctamente.`
+      ? `Solicitud #${requestId} creada y sincronizada con el MES Web correctamente.`
       : `Solicitud #${requestId} creada correctamente.`,
   });
 }));
@@ -3900,6 +3953,13 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
   }
 
   const partNumber = String(requestRow.PartNumber || '');
+  const requestTypeId = Number(requestRow.RequestTypeID);
+  const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
+
+  let storage = null;
+  let lotInternalLot = null;
+  let movementId = null;
+
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
@@ -3910,7 +3970,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
     }
 
     const [lotRows] = await connection.query(
-      'SELECT LotInventoryID, CurrentQuantity, CurrentLocationID FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
+      'SELECT LotInventoryID, CurrentQuantity, CurrentLocationID, CurrentInternalLot FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
       [requestRow.LotInventoryID]
     );
     const lotRow = lotRows[0];
@@ -3918,8 +3978,9 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       await connection.rollback();
       return res.status(404).json({ message: 'El lote de inventario asociado no fue encontrado.' });
     }
+    lotInternalLot = lotRow.CurrentInternalLot || null;
 
-    const storage = await getStorageFromLot(
+    storage = await getStorageFromLot(
       connection,
       requestId
     );
@@ -3930,8 +3991,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       return res.status(409).json({ message: 'El lote no tiene cantidad disponible para transferir.' });
     }
 
-    const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
-    const shouldValidateSourceLocation = !(Number(requestRow.RequestTypeID) === 6 && isQuarantineDestination);
+    const shouldValidateSourceLocation = !(requestTypeId === 6 && isQuarantineDestination);
     if (shouldValidateSourceLocation && sourceLocationId !== null && lotRow.CurrentLocationID != null && Number(lotRow.CurrentLocationID) !== sourceLocationId) {
       await connection.rollback();
       return res.status(409).json({ message: 'El lote no está en la ubicación de origen indicada en la solicitud.' });
@@ -3944,7 +4004,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       return res.status(400).json({ message: 'No se pudo determinar una ubicación de destino para la transferencia.' });
     }
 
-    const isPartialOutbound = [3, 12].includes(Number(requestRow.RequestTypeID));
+    const isPartialOutbound = [3, 12].includes(requestTypeId);
     if (!isPartialOutbound) {
       await connection.query(
         'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
@@ -3958,39 +4018,62 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
     // upsertInventoryFromLot es ahora la única fuente del registro de movimiento,
     // para evitar la doble inserción (una manual + una dentro de la función).
 
-    const requestStatusBefore = Number(requestRow.RequestStatusID);
-    const [updateRequestStatusResult] = await connection.query(
+    await connection.query(
       'UPDATE INVENTORY_REQUESTS SET RequestStatusID = 42, ConfirmUserID = ?, SubmitDate = NOW() WHERE RequestID = ?',
       [parsedUserId || requestRow.RegUserID, requestId]
     );
 
-    let movementId = null;
-    if (shouldApplyInventoryUpdate(42, Number(requestRow.RequestTypeID), Number(requestRow.LotInventoryID))) {
+    if (shouldApplyInventoryUpdate(42, requestTypeId, Number(requestRow.LotInventoryID))) {
       const upsertResult = await upsertInventoryFromLot(connection, {
         requestId,
         lotInventoryId: requestRow.LotInventoryID,
         partNumber: partNumber,
         quantity: parsedQty,
-        sourceLocationId: requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null,
+        sourceLocationId,
         destinationLocationId: destinationLocationId,
         userId: parsedUserId || requestRow.RegUserID,
         comments: normalizedComments || 'Transferencia confirmada',
         requestStatusId: 42,
-        requestTypeId: Number(requestRow.RequestTypeID),
+        requestTypeId,
       });
       movementId = upsertResult?.movementId ?? null;
     }
 
-    /*
-     * =====================================================
-     * SINCRONIZACIÓN CON ERP
-     * =====================================================
-     *
-     * Solo buscamos el rack cuando el lote está
-     * actualmente en LocationID = 5.
-     */
-    let erpWithdrawResult = null;
+    // Commit de todos los cambios locales ANTES de tocar el ERP. El ERP
+    // escribe esta misma fila (INVENTORY_REQUESTS) con su propia conexión;
+    // si lo llamáramos con esta transacción todavía abierta, su UPDATE
+    // quedaría bloqueado esperando a que soltemos el lock que esta misma
+    // llamada HTTP necesita para regresar -> interbloqueo.
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    console.error(
+      `[transfer] ERROR requestId=${requestId}:`,
+      {
+        message: error.message,
+        code: error.code,
+        sqlMessage: error.sqlMessage,
+        sql: error.sql,
+      }
+    );
+    throw error;
+  } finally {
+    connection.release();
+  }
 
+  /*
+   * =====================================================
+   * SINCRONIZACIÓN CON ERP (retiro de rack + confirmación del movimiento)
+   * =====================================================
+   * MES_DB ya quedó comprometido con RequestStatusID = 42. Si cualquiera
+   * de las dos llamadas ERP falla, se revierte todo con una transacción
+   * de compensación nueva (reverseSubmittedMovement), dejando la solicitud
+   * de vuelta en 41 sin cambios parciales.
+   */
+  let erpWithdrawResult = null;
+  let erpSubmitResult = null;
+
+  try {
     if (storage) {
       const erpResponse = await fetch(
         process.env.ERP_WITHDRAW_MATERIAL_URL,
@@ -4010,50 +4093,63 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       );
 
       erpWithdrawResult = await erpResponse.json();
-
       if (!erpResponse.ok) {
-        await connection.rollback();
-
-        return res.status(502).json({
-          message: 'La transferencia se realizó en MES, pero falló el retiro de material del rack en ERP.',
-          erp: erpWithdrawResult,
-        });
+        throw Object.assign(new Error('withdraw_rejected'), { erpDetail: erpWithdrawResult });
       }
     }
 
-    await connection.commit();
-
-    console.log(
-      `[transfer] requestId=${requestId} statusAfter=42 affectedRows=${updateRequestStatusResult.affectedRows}`
-    );
-
-    res.json({
-      ok: true,
-      movementId,
-      quantity: parsedQty,
-      erpWithdraw: erpWithdrawResult,
-      message: "Transferencia confirmada correctamente.",
+    erpSubmitResult = await erpClient.submitEntryForRequestType({
+      requestId,
+      requestTypeId,
+      qty: parsedQty,
+      batchNo: lotInternalLot || undefined,
     });
 
-  } catch (error) {
+    if (!erpSubmitResult.ok) {
+      throw Object.assign(new Error('submit_rejected'), { erpDetail: erpSubmitResult });
+    }
+  } catch (erpError) {
+    console.error(`[transfer] MES Web rechazó la operación para requestId=${requestId}:`, erpError.erpDetail || erpError);
 
-    await connection.rollback().catch(() => {});
-
-    console.error(
-      `[transfer] ERROR requestId=${requestId}:`,
-      {
-        message: error.message,
-        code: error.code,
-        sqlMessage: error.sqlMessage,
-        sql: error.sql,
+    const compConnection = await pool.getConnection();
+    let compensation = { reversed: false, reason: 'not_attempted' };
+    try {
+      await compConnection.beginTransaction();
+      compensation = await reverseSubmittedMovement(compConnection, {
+        requestId,
+        requestTypeId,
+        lotInventoryId: requestRow.LotInventoryID,
+        sourceLocationId,
+      });
+      if (compensation.reversed) {
+        await compConnection.query(
+          "UPDATE INVENTORY_REQUESTS SET RequestStatusID = 41, SubmitDate = NULL WHERE RequestID = ?",
+          [requestId]
+        );
       }
-    );
+      await compConnection.commit();
+    } catch (compensationError) {
+      await compConnection.rollback().catch(() => {});
+      console.error(`[transfer] Falló la reversión compensatoria para requestId=${requestId}:`, compensationError);
+      compensation = { reversed: false, reason: 'compensation_failed' };
+    } finally {
+      compConnection.release();
+    }
 
-    throw error;
-
-  } finally {
-    connection.release();
+    console.error(`[transfer] requestId=${requestId} revertido=${compensation.reversed} razon=${compensation.reason || 'n/a'}`);
+    return res.status(502).json({ message: 'No se pudo completar la operación, intenta de nuevo.' });
   }
+
+  console.log(`[transfer] requestId=${requestId} statusAfter=42`);
+
+  res.json({
+    ok: true,
+    movementId,
+    quantity: parsedQty,
+    erpWithdraw: erpWithdrawResult,
+    erpSubmit: erpSubmitResult.data,
+    message: "Transferencia confirmada correctamente.",
+  });
 });
 
 app.post("/api/requests/:id(\\d+)/execute-transfer", handleExecuteTransfer);
@@ -4763,8 +4859,8 @@ app.post(
 
     return res.status(502).json({
       message: rolledBack
-        ? `El ERP rechazó la solicitud; el registro #${requestId} en MES_DB fue eliminado.`
-        : `El ERP rechazó la solicitud y el registro #${requestId} ya no estaba en DRAFT, por lo que no se eliminó automáticamente. Requiere revisión manual.`,
+        ? `El MES Web rechazó la solicitud; el registro #${requestId} en MES_DB fue eliminado.`
+        : `El MES Web rechazó la solicitud y el registro #${requestId} ya no estaba en DRAFT, por lo que no se eliminó automáticamente. Requiere revisión manual.`,
       erp: erpResult,
       rolledBack,
     });
@@ -4845,8 +4941,8 @@ app.put(
 
     return res.status(502).json({
       message: compensation.reversed
-        ? `El ERP rechazó la confirmación; el movimiento de la solicitud #${requestId} en MES_DB fue revertido.`
-        : `El ERP rechazó la confirmación y no se pudo revertir automáticamente el movimiento de la solicitud #${requestId} (${compensation.reason}). Requiere revisión manual.`,
+        ? `El MES Web rechazó la confirmación; el movimiento de la solicitud #${requestId} en MES_DB fue revertido.`
+        : `El MES Web rechazó la confirmación y no se pudo revertir automáticamente el movimiento de la solicitud #${requestId} (${compensation.reason}). Requiere revisión manual.`,
       erp: erpResult,
       rolledBack: compensation.reversed,
     });

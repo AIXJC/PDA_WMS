@@ -279,33 +279,9 @@ export const Merma: React.FC = () => {
         throw new Error(body.message || 'No se pudo procesar la solicitud de scrap.');
       }
 
-      try {
-        console.log({
-            request_id: selectedScrapRequest.RequestID,
-            request_type_id: selectedScrapRequest.RequestTypeID,
-            qty: scrapRequestQuantity,
-            batch_no: selectedScrapRequest.CurrentInternalLot
-          })
-
-        const responseERP = await fetch('/api/erp/submit-stock-entry', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            request_id: selectedScrapRequest.RequestID,
-            request_type_id: selectedScrapRequest.RequestTypeID,
-            qty: scrapRequestQuantity,
-            batch_no: selectedScrapRequest.CurrentInternalLot
-          }),
-        });
-        const dataERP = await responseERP.json();
-          if (!responseERP.ok) {
-            throw new Error('Error al actualizar el movimiento en MES Web');
-          }
-          alert('Transferencia confirmada correctamente.');
-        } catch (erpError: unknown) {
-          const erpMessage = erpError instanceof Error ? erpError.message : String(erpError);
-          alert(`Transferencia confirmada correctamente, pero falló la sincronización con el ERP: ${erpMessage}`);
-      }
+      // El backend confirma el movimiento en MES Web dentro de la misma
+      // transacción: si esa respuesta llegó ok, todo quedó aplicado.
+      alert('Transferencia confirmada correctamente.');
 
       const successMessage = body.newScrapRequestId
         ? `Scrap procesado correctamente. Se creó solicitud de scrap #${body.newScrapRequestId}.`

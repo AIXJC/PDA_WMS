@@ -98,7 +98,7 @@ export const Requests: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (showCreate && (form.RequestTypeID === '2' || form.RequestTypeID === '12')) {
+    if (showCreate && (form.RequestTypeID === '2' || form.RequestTypeID === '3' || form.RequestTypeID === '12')) {
       const timer = window.setTimeout(() => {
         lotSearchInputRef.current?.focus();
         lotSearchInputRef.current?.select();
@@ -138,7 +138,7 @@ export const Requests: React.FC = () => {
     setShowCreate(true);
     setForm((prev) => ({
       ...prev,
-      RequestTypeID: outboundBridge ? '12' : '2',
+      RequestTypeID: outboundBridge ? '12' : '3',
       LotReceiveID: String(lotInventoryId),
       PartNumber: prev.PartNumber || '',
       Quantity: prev.Quantity || '1',
@@ -286,7 +286,17 @@ export const Requests: React.FC = () => {
       const d = await r.json();
       const allTypes = Array.isArray(d.requestTypes) ? d.requestTypes : [];
       // Exclude consumption-type and the unsupported PDA request types from the general Requests UI
-      setRequestTypes(allTypes.filter((t: any) => !isHiddenRequestType(t.RequestType || t.RequestDescription)));
+      const params = new URLSearchParams(window.location.search);
+      const outboundBridge = params.get('from') === 'outbound';
+
+      const filteredTypes = outboundBridge
+        ? allTypes.filter((t: any) => [3, 12].includes(Number(t.RequestTypeID)))
+        : allTypes.filter(
+            (t: any) =>
+              !isHiddenRequestType(t.RequestType || t.RequestDescription)
+          );
+
+      setRequestTypes(filteredTypes);
     } catch (e) {
       console.error('Error loading request types', e);
     }
@@ -360,7 +370,13 @@ export const Requests: React.FC = () => {
       const d = await r.json();
       const all = Array.isArray(d.requests) ? d.requests : [];
       // Remove requests that are handled by the Salidas module and those that should not appear in the PDA Requests UI
-      setRequests(all.filter((req: any) => !isHiddenRequestType(req.RequestTypeName || req.RequestTypeDescription)));
+      setRequests(all.filter((req: any) => {
+        // Los tipos 3 (Consumo) y 12 (Transferencia parcial) siempre deben
+        // listarse aquí aunque su etiqueta coincida con isHiddenRequestType
+        // (p.ej. "CONSUMPTION" matchea el filtro de "consum").
+        if ([3, 12].includes(Number(req.RequestTypeID))) return true;
+        return !isHiddenRequestType(req.RequestTypeName || req.RequestTypeDescription);
+      }));
     } catch (e) {
       console.error(e);
       if (showLoading) {
@@ -380,7 +396,7 @@ export const Requests: React.FC = () => {
     const normalizedPartNumber = form.PartNumber.trim();
     const normalizedQty = Number(form.Quantity);
 
-    if (selectedRequestTypeId === 2 || selectedRequestTypeId === 12) {
+    if (selectedRequestTypeId === 2 || selectedRequestTypeId === 3 || selectedRequestTypeId === 12) {
       const selectedLotInventory = lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(form.LotReceiveID));
       if (!selectedLotInventory) {
         alert('Selecciona un lote de inventario para la transferencia');
@@ -394,7 +410,7 @@ export const Requests: React.FC = () => {
         alert('Ingresa una cantidad válida');
         return;
       }
-      if (selectedRequestTypeId === 12 && maxAllowedQuantity != null && normalizedQty > maxAllowedQuantity) {
+      if ((selectedRequestTypeId === 12 || selectedRequestTypeId === 3) && maxAllowedQuantity != null && normalizedQty > maxAllowedQuantity) {
         alert(`La cantidad no puede superar el stock disponible en el lote (${maxAllowedQuantity}).`);
         return;
       }
@@ -409,7 +425,7 @@ export const Requests: React.FC = () => {
 
     setSubmitting(true);
     try {
-      const selectedLotInventory = selectedRequestTypeId === 2 || selectedRequestTypeId === 12
+      const selectedLotInventory = selectedRequestTypeId === 2 || selectedRequestTypeId === 3 || selectedRequestTypeId === 12
         ? lotInventoryOptions.find((item) => String(item.LotInventoryID) === String(form.LotReceiveID)) || null
         : null;
       const payload = {
@@ -423,8 +439,8 @@ export const Requests: React.FC = () => {
         Comments: form.Comments.trim() || undefined,
         SourceLocationID: selectedLotInventory?.CurrentLocationID ? Number(selectedLotInventory.CurrentLocationID) : (form.SourceLocationID ? Number(form.SourceLocationID) : undefined),
         DestinationLocationID: form.DestinationLocationID ? Number(form.DestinationLocationID) : undefined,
-        LotReceiveID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 12) && selectedLotInventory?.LotReceiveID ? Number(selectedLotInventory.LotReceiveID) : (form.RequestTypeID === '6' && form.LotReceiveID ? Number(form.LotReceiveID) : undefined),
-        LotInventoryID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 12) && selectedLotInventory?.LotInventoryID ? Number(selectedLotInventory.LotInventoryID) : undefined,
+        LotReceiveID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 3 || selectedRequestTypeId === 12) && selectedLotInventory?.LotReceiveID ? Number(selectedLotInventory.LotReceiveID) : (form.RequestTypeID === '6' && form.LotReceiveID ? Number(form.LotReceiveID) : undefined),
+        LotInventoryID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 3 || selectedRequestTypeId === 12) && selectedLotInventory?.LotInventoryID ? Number(selectedLotInventory.LotInventoryID) : undefined,
       };
 
       const r = await fetch('/api/requests', {
@@ -474,7 +490,8 @@ export const Requests: React.FC = () => {
   const maxAllowedQuantity = availableStock && Number.isFinite(availableStock) ? Math.max(1, availableStock) : undefined;
   const isFullTransferRequest = form.RequestTypeID === '2';
   const isPartialTransferRequest = form.RequestTypeID === '12';
-  const isTransferRequest = isFullTransferRequest || isPartialTransferRequest;
+  const isConsumptionRequest = form.RequestTypeID === '3';
+  const isTransferRequest = isFullTransferRequest || isPartialTransferRequest || isConsumptionRequest;
   const isStorageLocationName = (locationName?: string) => {
     const normalized = String(locationName || '').toLowerCase();
     return /stor|almac/.test(normalized);
@@ -544,7 +561,7 @@ export const Requests: React.FC = () => {
                 </select>
               </div>
 
-              {!(form.RequestTypeID === '2' || form.RequestTypeID === '12') ? (
+              {!(form.RequestTypeID === '2' || form.RequestTypeID === '3' || form.RequestTypeID === '12') ? (
                 <div className="space-y-2">
                   <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Producto</label>
                   <select
@@ -570,7 +587,7 @@ export const Requests: React.FC = () => {
                 </div>
               ) : null}
 
-              {(form.RequestTypeID === '2' || form.RequestTypeID === '12') && (
+              {(form.RequestTypeID === '2' || form.RequestTypeID === '3' || form.RequestTypeID === '12') && (
                 <div className="space-y-2">
                   <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">Lote de inventario / transferencia</label>
                   <input
