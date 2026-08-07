@@ -4189,7 +4189,7 @@ app.post("/api/requests/:id(\\d+)/execute-transfer", handleExecuteTransfer);
 
 // Revierte lo hecho por completeStorageTransfer cuando la confirmación (URL 2) o el
 // mapa visual de racks (URL 3) fallan después de que MES_DB ya quedó comprometido.
-async function reverseStorageTransferCompletion(connection, { requestId, lotInventoryId, sourceLocationId, storageId, partNumber }) {
+async function reverseStorageTransferCompletion(connection, { requestId, lotInventoryId, sourceLocationId, storageId, partNumber, priorInventoryId }) {
   const [movementRows] = await connection.query(
     'SELECT MovementID, Quantity FROM INVENTORY_MOVEMENTS_HISTORY WHERE RequestID = ? ORDER BY MovementID DESC LIMIT 1 FOR UPDATE',
     [requestId]
@@ -4200,8 +4200,8 @@ async function reverseStorageTransferCompletion(connection, { requestId, lotInve
   const quantity = Number(movement.Quantity || 0);
 
   await connection.query(
-    'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
-    [sourceLocationId, lotInventoryId]
+    'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ?, InventoryID = ? WHERE LotInventoryID = ?',
+    [sourceLocationId, priorInventoryId ?? null, lotInventoryId]
   );
 
   const [inventoryRows] = await connection.query(
@@ -4285,13 +4285,14 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
 
   let quantity = 0;
   let lotInternalLot = null;
+  let priorInventoryId = null;
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
 
     const [lotRows] = await connection.query(
-      'SELECT CurrentQuantity, CurrentLocationID, CurrentInternalLot FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
+      'SELECT CurrentQuantity, CurrentLocationID, CurrentInternalLot, InventoryID FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? FOR UPDATE',
       [lotInventoryId]
     );
     const lotRow = lotRows[0];
@@ -4305,31 +4306,39 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
     }
     quantity = Number(lotRow.CurrentQuantity || 0);
     lotInternalLot = lotRow.CurrentInternalLot || null;
+    priorInventoryId = lotRow.InventoryID != null ? Number(lotRow.InventoryID) : null;
     if (!(quantity > 0)) {
       await connection.rollback();
       return res.status(409).json({ message: 'El lote no tiene cantidad disponible para transferir.' });
     }
 
-    await connection.query(
-      'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
-      [CYCLIC_COUNT_STORAGE_LOCATION_ID, lotInventoryId]
-    );
-
+    // Un mismo número de parte puede vivir en varios racks de MES_INVENTORY —
+    // solo se suma a un registro existente cuando parte Y rack coinciden; si el
+    // rack elegido es distinto, se crea un registro nuevo y ese es el que se
+    // enlaza en MES_LOT_INVENTORY.InventoryID.
     const [existingInventoryRows] = await connection.query(
       'SELECT InventoryID FROM MES_INVENTORY WHERE PartNumber = ? AND RackLocationID = ? FOR UPDATE',
       [partNumber, parsedStorageId]
     );
+    let inventoryId;
     if (existingInventoryRows[0]) {
+      inventoryId = Number(existingInventoryRows[0].InventoryID);
       await connection.query(
         'UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?',
-        [quantity, existingInventoryRows[0].InventoryID]
+        [quantity, inventoryId]
       );
     } else {
-      await connection.query(
+      const [insertInventoryResult] = await connection.query(
         'INSERT INTO MES_INVENTORY (PartNumber, RackLocationID, Quantity, LastUpdate) VALUES (?, ?, ?, NOW())',
         [partNumber, parsedStorageId, quantity]
       );
+      inventoryId = Number(insertInventoryResult.insertId);
     }
+
+    await connection.query(
+      'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ?, InventoryID = ? WHERE LotInventoryID = ?',
+      [CYCLIC_COUNT_STORAGE_LOCATION_ID, inventoryId, lotInventoryId]
+    );
 
     await connection.query(`
       INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
@@ -4401,6 +4410,7 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
         sourceLocationId,
         storageId: parsedStorageId,
         partNumber,
+        priorInventoryId,
       });
       await compConnection.commit();
     } catch (compensationError) {
