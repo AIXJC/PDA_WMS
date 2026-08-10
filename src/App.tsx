@@ -8,7 +8,7 @@ import { Dashboard } from './Pages/Dashboard';
 import { Scanner } from './Pages/Scanner';
 import { Inventory } from './Pages/Inventory';
 import { Orders } from './Pages/Orders';
-import { Merma } from './Pages/Merma';
+import { Scrap } from './Pages/Scrap';
 import { Settings } from './Pages/Settings';
 import { Notifications } from './Pages/Notifications';
 import { Reports } from './Pages/Reports';
@@ -98,9 +98,9 @@ function App() {
           </ProtectedRoute>
         } />
         
-        <Route path="/merma" element={
+        <Route path="/scrap" element={
           <ProtectedRoute>
-            <Merma />
+            <Scrap />
           </ProtectedRoute>
         } />
         

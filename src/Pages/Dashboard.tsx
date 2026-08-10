@@ -22,7 +22,7 @@ const modules = (t: (k: string) => string) => [
   { id: 'inbound', label: t('dashboard.entry'), icon: ArrowDownCircle, color: 'bg-emerald-500', path: '/orders/inbound' },
   { id: 'outbound', label: t('dashboard.exit'), icon: ArrowUpCircle, color: 'bg-blue-500', path: '/orders/outbound' },
   { id: 'inventory', label: t('dashboard.inventory'), icon: Package, color: 'bg-amber-500', path: '/inventory' },
-  { id: 'merma', label: t('dashboard.scrap'), icon: Trash2, color: 'bg-rose-500', path: '/merma' },
+  { id: 'scrap', label: t('dashboard.scrap'), icon: Trash2, color: 'bg-rose-500', path: '/scrap' },
   { id: 'requests', label: t('dashboard.requests'), icon: FileText, color: 'bg-indigo-500', path: '/requests' },
   { id: 'cyclic', label: t('dashboard.cyclic'), icon: RefreshCw, color: 'bg-cyan-500', path: '/inventory/cyclic' },
   { id: 'transfers', label: t('dashboard.transfers'), icon: MoveHorizontal, color: 'bg-violet-500', path: '/transfers' },

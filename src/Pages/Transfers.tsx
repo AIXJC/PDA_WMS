@@ -180,7 +180,7 @@ export const Transfers: React.FC = () => {
       // Solo se ejecutan transferencias ya aprobadas por el ERP (estado 41) y de tipos transferibles para salidas/transferencias
       const r = await fetch('/api/requests?status=41');
       const d = await r.json();
-      const nextRequests = ((d.requests || []) as Req[]).filter((req) => [2, 3, 12].includes(Number(req.RequestTypeID || 0)));
+      const nextRequests = ((d.requests || []) as Req[]).filter((req) => [2, 3, 6, 12].includes(Number(req.RequestTypeID || 0)));
       setRequests(nextRequests);
       if (showLoading) setPage(1);
       await loadLotTraceability(nextRequests);
@@ -204,6 +204,18 @@ export const Transfers: React.FC = () => {
     ? isScrapOrQuarantineLocation(locationNames[currentRequest.DestinationLocationID] || '')
     : false;
 
+  const isScrapRequest = (req: Req | null) => Number(req?.RequestTypeID) === 6;
+
+  // LocationID 19 ("Confirmed Scrap") es el destino fijo de las solicitudes de scrap
+  // ("dar de baja"): no hay una ubicación física real de destino, el material simplemente
+  // se descuenta y queda contabilizado ahí.
+  const SCRAP_CONFIRMED_LOCATION_ID = 19;
+  const describeDestinationLocation = (locationId?: number) => {
+    if (locationId === SCRAP_CONFIRMED_LOCATION_ID) return 'Baja de inventario';
+    if (!locationId) return 'Sin destino definido';
+    return locationNames[locationId] || `#${locationId}`;
+  };
+
   const totalPages = Math.max(1, Math.ceil(requests.length / PAGE_SIZE));
   const pagedRequests = requests.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
@@ -214,11 +226,14 @@ export const Transfers: React.FC = () => {
     setQuantityInput(String(defaultQty));
   }
 
-  const isIncomingStorageTransfer = (req: Req) => {
+  // Cualquier transferencia completa cuyo destino sea Storage requiere elegir un rack
+  // físico (reutiliza el mismo modal y el mismo endpoint complete-storage-transfer,
+  // que ya acepta Incoming o Purgue como origen).
+  const requiresRackSelection = (req: Req) => {
     if (Number(req.RequestTypeID) !== 2) return false;
     const sourceName = req.SourceLocationID ? String(locationNames[req.SourceLocationID] || '').toLowerCase() : '';
     const destinationName = req.DestinationLocationID ? String(locationNames[req.DestinationLocationID] || '').toLowerCase() : '';
-    return sourceName.includes('incoming') && /stor|almac/.test(destinationName);
+    return (sourceName.includes('incoming') || sourceName.includes('purg')) && /stor|almac/.test(destinationName);
   };
 
   const getStorageLocationCode = (location: StorageLocation) => {
@@ -310,21 +325,17 @@ export const Transfers: React.FC = () => {
       return;
     }
 
-    const locationLabel = currentRequest.DestinationLocationID
-      ? (
-          locationNames[currentRequest.DestinationLocationID] ||
-          `#${currentRequest.DestinationLocationID}`
-        )
-      : 'Sin destino definido';
+    const locationLabel = describeDestinationLocation(currentRequest.DestinationLocationID);
 
-    if (
-      !confirm(
-        `${t('transfers.confirmExecute')}\n` +
+    const confirmMessage = isScrapRequest(currentRequest)
+      ? `Confirmar baja de ${currentRequest.PartNumber} x ${parsedQuantity}\n\n` +
+        `El lote se mantiene en su ubicación de cuarentena y solo se descuenta la cantidad indicada.`
+      : `${t('transfers.confirmExecute')}\n` +
         `${currentRequest.PartNumber} x ${parsedQuantity}\n` +
         `Destino: ${locationLabel}\n\n` +
-        `Para salidas parciales, el lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada.`
-      )
-    ) {
+        `Para salidas parciales, el lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada.`;
+
+    if (!confirm(confirmMessage)) {
       return;
     }
 
@@ -345,7 +356,7 @@ export const Transfers: React.FC = () => {
             regUserId: user?.id || null,
             quantity: parsedQuantity,
             sourceLocationId: currentRequest.SourceLocationID || null,
-            destinationLocationId: currentRequest.DestinationLocationID || null,
+            destinationLocationId: currentRequest.DestinationLocationID != null ? currentRequest.DestinationLocationID : null,
           }),
         }
       );
@@ -362,7 +373,7 @@ export const Transfers: React.FC = () => {
       notifyAppRefresh('action');
       await load(false);
 
-      alert('Transferencia confirmada correctamente.');
+      alert(isScrapRequest(currentRequest) ? 'Baja confirmada correctamente.' : 'Transferencia confirmada correctamente.');
 
     } catch (e) {
       const message =
@@ -401,9 +412,16 @@ export const Transfers: React.FC = () => {
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0 flex-1 space-y-3">
                   <div className="space-y-1">
-                    <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">
-                      Solicitud #{r.RequestID}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">
+                        Solicitud #{r.RequestID}
+                      </span>
+                      {isScrapRequest(r) ? (
+                        <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[9px] font-black uppercase tracking-[0.2em] text-rose-600 dark:bg-rose-500/10 dark:text-rose-300">
+                          Scrap
+                        </span>
+                      ) : null}
+                    </div>
                     <div className="break-words text-base font-black leading-snug text-slate-900 dark:text-slate-100">
                       {r.PartNumber}
                     </div>
@@ -419,9 +437,9 @@ export const Transfers: React.FC = () => {
                           Origen: {locationNames[r.SourceLocationID] || `#${r.SourceLocationID}`}
                         </span>
                       ) : null}
-                      {r.DestinationLocationID ? (
+                      {r.DestinationLocationID != null ? (
                         <span className="w-fit rounded-full bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700 break-words dark:bg-emerald-500/10 dark:text-emerald-300">
-                          Destino: {locationNames[r.DestinationLocationID] || `#${r.DestinationLocationID}`}
+                          Destino: {describeDestinationLocation(r.DestinationLocationID)}
                         </span>
                       ) : null}
                     </div>
@@ -448,7 +466,7 @@ export const Transfers: React.FC = () => {
 
                 <div className="flex shrink-0 items-center justify-end gap-2 sm:justify-start">
                   {Number(r.RequestStatusID) === 41 ? (
-                    isIncomingStorageTransfer(r) ? (
+                    requiresRackSelection(r) ? (
                       <button
                         disabled={completingRack === r.RequestID}
                         onClick={() => openRackPicker(r)}
@@ -468,7 +486,7 @@ export const Transfers: React.FC = () => {
                         ) : (
                           <>
                             <Check size={14} />
-                            <span>Empezar transferencia</span>
+                            <span>{isScrapRequest(r) ? 'Confirmar baja' : 'Empezar transferencia'}</span>
                           </>
                         )}
                       </button>
@@ -554,7 +572,7 @@ export const Transfers: React.FC = () => {
                   );
                 })()}
                 <div className="mt-2 break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-                  Destino sugerido: {currentRequest.DestinationLocationID ? (locationNames[currentRequest.DestinationLocationID] || `#${currentRequest.DestinationLocationID}`) : 'Sin destino definido'}
+                  Destino sugerido: {describeDestinationLocation(currentRequest.DestinationLocationID)}
                 </div>
               </div>
             ) : null}

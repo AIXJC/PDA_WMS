@@ -131,6 +131,51 @@ function getSearch(value) {
   return String(value || "").trim();
 }
 
+// Convención de locaciones confirmada contra PLANT_LOCATIONS real: LocationNumber
+// terminado en 00 es un área "base" (almacén/proceso) y terminado en 10 es su área
+// de cuarentena pareja (p.ej. Storage=300 <-> Purgue=310, Production=400 <->
+// Quarantine-Scrap-NCM=410). Reemplaza la heurística de texto sobre LocationName
+// que se usaba antes para detectar ubicaciones de cuarentena.
+async function getQuarantinePairing() {
+  const [rows] = await pool.query('SELECT LocationID, LocationNumber, LocationName FROM PLANT_LOCATIONS');
+  const byNumber = new Map(rows.map((row) => [Number(row.LocationNumber), row]));
+  const byId = new Map(rows.map((row) => [Number(row.LocationID), row]));
+
+  const pairingByLocationId = new Map();
+  for (const row of rows) {
+    const locationNumber = Number(row.LocationNumber);
+    const remainder = locationNumber % 100;
+    const baseNumber = locationNumber - remainder;
+
+    if (remainder === 0) {
+      const quarantineRow = byNumber.get(baseNumber + 10) || null;
+      pairingByLocationId.set(Number(row.LocationID), {
+        isBase: true,
+        isQuarantine: false,
+        pairedLocationId: quarantineRow ? Number(quarantineRow.LocationID) : null,
+        pairedLocationName: quarantineRow ? quarantineRow.LocationName : null,
+      });
+    } else if (remainder === 10) {
+      const baseRow = byNumber.get(baseNumber) || null;
+      pairingByLocationId.set(Number(row.LocationID), {
+        isBase: false,
+        isQuarantine: true,
+        pairedLocationId: baseRow ? Number(baseRow.LocationID) : null,
+        pairedLocationName: baseRow ? baseRow.LocationName : null,
+      });
+    } else {
+      pairingByLocationId.set(Number(row.LocationID), {
+        isBase: false,
+        isQuarantine: false,
+        pairedLocationId: null,
+        pairedLocationName: null,
+      });
+    }
+  }
+
+  return { rows, byId, pairingByLocationId };
+}
+
 function normalizeRowNumbers(rows) {
   return rows.map((row) => {
     const normalized = { ...row };
@@ -749,6 +794,12 @@ app.get("/api/scanner/:code", asyncRoute(async (req, res) => {
 
 const CYCLIC_COUNT_STATUS_IDS = [46, 47, 48, 49]; // COMPLETED, IN_PROCESS, CANCELLED, REQUIRES_RECOUNT
 const CYCLIC_COUNT_STORAGE_LOCATION_ID = 5; // MES_LOT_INVENTORY.CurrentLocationID required to allow a physical count
+// Destino "sin ubicación física" para solicitudes de scrap (RequestTypeID=6). No se puede
+// usar LocationID=0 porque INVENTORY_REQUESTS.DestinationLocationID tiene FK contra
+// PLANT_LOCATIONS y ese LocationID no existe; LocationID 19 ("Confirmed Scrap",
+// LocationNumber=0, LocationArea='Scrap') ya está en el catálogo para este propósito.
+const SCRAP_CONFIRMED_LOCATION_ID = 19;
+const PURGUE_LOCATION_ID = 6; // PLANT_LOCATIONS "Purgue" (LocationNumber 310), pareja de cuarentena de Storage
 
 const CYCLIC_COUNT_SELECT_FIELDS = `
   cc.CycleCountID,
@@ -2286,8 +2337,24 @@ app.post("/api/transfers", asyncRoute(async (req, res) => {
   }
 }));
 
+// Histórico de solicitudes de scrap (RequestTypeID=6) pendientes (40) o aprobadas (41).
+// Es de solo lectura: la ejecución física ahora ocurre en el módulo de Transferencias
+// (POST /api/requests/:id/execute-transfer), no aquí.
 app.get("/api/scrap/requests", asyncRoute(async (req, res) => {
-  const limit = getLimit(req.query.limit, 100);
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = getLimit(req.query.limit, 20);
+  const offset = (page - 1) * limit;
+
+  // status=40 (pendiente) o status=41 (aprobada); cualquier otro valor (u omitido) muestra ambas.
+  const requestedStatus = [40, 41].includes(Number(req.query.status)) ? [Number(req.query.status)] : [40, 41];
+  const statusPlaceholders = requestedStatus.map(() => '?').join(', ');
+
+  const countRows = await query(
+    `SELECT COUNT(*) AS total FROM INVENTORY_REQUESTS req WHERE req.RequestTypeID = 6 AND req.RequestStatusID IN (${statusPlaceholders})`,
+    requestedStatus
+  );
+  const total = Number(countRows[0]?.total || 0);
+
   const rows = await query(`
     SELECT
       req.RequestID,
@@ -2310,23 +2377,184 @@ app.get("/api/scrap/requests", asyncRoute(async (req, res) => {
     LEFT JOIN MES_MASTER_ITEMS item ON item.PartNumber = req.PartNumber
     LEFT JOIN PLANT_LOCATIONS source ON source.LocationID = req.SourceLocationID
     LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
-    WHERE req.RequestStatusID IN (40, 41)
-      AND (
-        req.RequestTypeID = 6
-        OR req.RequestTypeID = 2
-        OR req.RequestTypeID = 3
-      )
-      AND (
-        LOWER(COALESCE(dest.LocationName, '')) LIKE '%quarantine%'
-        OR LOWER(COALESCE(dest.LocationName, '')) LIKE '%purg%'
-        OR LOWER(COALESCE(dest.LocationName, '')) LIKE '%cuarentena%'
-        OR LOWER(COALESCE(dest.LocationName, '')) LIKE '%purgue%'
-      )
+    WHERE req.RequestTypeID = 6
+      AND req.RequestStatusID IN (${statusPlaceholders})
     ORDER BY req.RequestStatusID ASC, req.RequestID DESC
     LIMIT ?
-  `, [limit]);
+    OFFSET ?
+  `, [...requestedStatus, limit, offset]);
 
-  res.json({ count: rows.length, requests: rows });
+  res.json({
+    requests: rows,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  });
+}));
+
+// PartNumber de un lote no siempre está poblado en MES_INVENTORY (solo cubre lotes que ya
+// pasaron por un movimiento de inventario) — este JOIN resuelve también por la cadena de
+// recepción original (SHIPPING_RECEIVING_LOTS -> ERP_PURCHASE_RECEIPT_DETAIL -> ITEM),
+// igual que ya hace GET /api/requests/lots.
+const LOT_PART_JOINS = `
+  LEFT JOIN MES_INVENTORY directInv ON directInv.InventoryID = li.InventoryID
+  LEFT JOIN SHIPPING_RECEIVING_LOTS srl ON srl.LotReceiveID = li.LotReceiveID
+  LEFT JOIN ERP_PURCHASE_RECEIPT_DETAIL detail ON detail.PurchaseReceiptDetailID = srl.PurchaseReceiptDetailID
+  LEFT JOIN MES_MASTER_ITEMS chainItem ON chainItem.ItemID = detail.ItemID
+  LEFT JOIN MES_MASTER_ITEMS master ON master.PartNumber = COALESCE(directInv.PartNumber, chainItem.PartNumber)
+`;
+const LOT_PART_NUMBER_EXPR = 'COALESCE(directInv.PartNumber, chainItem.PartNumber)';
+
+// Localiza un lote por código de barras, part number o referencia de lote y devuelve,
+// además de sus datos, si ya está en su área de cuarentena (terminación "10") o cuál es
+// la locación de cuarentena pareja a la que debe transferirse primero.
+app.get("/api/scrap/lookup", asyncRoute(async (req, res) => {
+  const code = getSearch(req.query.code);
+  if (!code) {
+    return res.status(400).json({ message: "Debe indicar un código, part number o lote." });
+  }
+
+  const [rows] = await pool.query(`
+    SELECT
+      li.LotInventoryID,
+      li.LotReceiveID,
+      li.CurrentInternalLot,
+      li.CurrentLocationID,
+      li.CurrentQuantity,
+      ${LOT_PART_NUMBER_EXPR} AS PartNumber,
+      master.PartName,
+      master.UnitType,
+      plant.LocationName AS CurrentLocationName
+    FROM MES_LOT_INVENTORY li
+    ${LOT_PART_JOINS}
+    LEFT JOIN PLANT_LOCATIONS plant ON plant.LocationID = li.CurrentLocationID
+    WHERE COALESCE(li.CurrentQuantity, 0) > 0
+      AND (
+        li.CurrentInternalLot = ?
+        OR CAST(li.LotReceiveID AS CHAR) = ?
+        OR srl.ProviderLot = ?
+        OR srl.ShortInternalLot = ?
+        OR ${LOT_PART_NUMBER_EXPR} = ?
+      )
+    ORDER BY li.LotInventoryID DESC
+    LIMIT 1
+  `, [code, code, code, code, code]);
+
+  const lot = rows[0];
+  if (!lot) {
+    return res.status(404).json({ message: "No se encontró el producto ni el lote con esa referencia." });
+  }
+
+  const { pairingByLocationId } = await getQuarantinePairing();
+  const currentLocationId = lot.CurrentLocationID != null ? Number(lot.CurrentLocationID) : null;
+  const pairing = currentLocationId != null ? pairingByLocationId.get(currentLocationId) : null;
+  const isInQuarantine = Boolean(pairing?.isQuarantine);
+
+  res.json({
+    lot: {
+      LotInventoryID: Number(lot.LotInventoryID),
+      LotReceiveID: lot.LotReceiveID != null ? Number(lot.LotReceiveID) : null,
+      PartNumber: lot.PartNumber,
+      PartName: lot.PartName || lot.PartNumber,
+      UnitType: lot.UnitType || '',
+      CurrentInternalLot: lot.CurrentInternalLot,
+      CurrentQuantity: Number(lot.CurrentQuantity || 0),
+      CurrentLocationID: currentLocationId,
+      CurrentLocationName: lot.CurrentLocationName || null,
+    },
+    isInQuarantine,
+    quarantineLocationId: isInQuarantine ? currentLocationId : (pairing?.pairedLocationId ?? null),
+    quarantineLocationName: isInQuarantine ? lot.CurrentLocationName : (pairing?.pairedLocationName ?? null),
+    baseLocationId: isInQuarantine ? (pairing?.pairedLocationId ?? null) : currentLocationId,
+    baseLocationName: isInQuarantine ? (pairing?.pairedLocationName ?? null) : lot.CurrentLocationName,
+  });
+}));
+
+// Locaciones de cuarentena (LocationNumber terminado en 10) con el conteo de lotes que
+// tienen actualmente. Alimenta el navegador de cuarentena del módulo de Scrap.
+app.get("/api/scrap/quarantine-locations", asyncRoute(async (req, res) => {
+  const { rows } = await getQuarantinePairing();
+  const quarantineLocations = rows.filter((row) => Number(row.LocationNumber) % 100 === 10);
+
+  const counts = await query(`
+    SELECT CurrentLocationID AS LocationID, COUNT(*) AS lotCount
+    FROM MES_LOT_INVENTORY
+    WHERE COALESCE(CurrentQuantity, 0) > 0
+    GROUP BY CurrentLocationID
+  `);
+  const countByLocation = new Map(counts.map((row) => [Number(row.LocationID), Number(row.lotCount)]));
+
+  res.json({
+    locations: quarantineLocations.map((row) => ({
+      LocationID: Number(row.LocationID),
+      LocationNumber: Number(row.LocationNumber),
+      LocationName: row.LocationName,
+      lotCount: countByLocation.get(Number(row.LocationID)) || 0,
+    })),
+  });
+}));
+
+// Lotes paginados dentro de una locación de cuarentena específica, con la locación base
+// pareada (para "devolver a origen").
+app.get("/api/scrap/quarantine-locations/:locationId(\\d+)/lots", asyncRoute(async (req, res) => {
+  const locationId = Number(req.params.locationId);
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = getLimit(req.query.limit, 20);
+  const offset = (page - 1) * limit;
+
+  const { pairingByLocationId } = await getQuarantinePairing();
+  const pairing = pairingByLocationId.get(locationId);
+  if (!pairing || !pairing.isQuarantine) {
+    return res.status(400).json({ message: "La ubicación indicada no es un área de cuarentena." });
+  }
+
+  const countRows = await query(
+    `SELECT COUNT(*) AS total FROM MES_LOT_INVENTORY li WHERE li.CurrentLocationID = ? AND COALESCE(li.CurrentQuantity, 0) > 0`,
+    [locationId]
+  );
+  const total = Number(countRows[0]?.total || 0);
+
+  const rows = await query(`
+    SELECT
+      li.LotInventoryID,
+      li.LotReceiveID,
+      li.CurrentInternalLot,
+      li.CurrentQuantity,
+      ${LOT_PART_NUMBER_EXPR} AS PartNumber,
+      master.PartName
+    FROM MES_LOT_INVENTORY li
+    ${LOT_PART_JOINS}
+    WHERE li.CurrentLocationID = ?
+      AND COALESCE(li.CurrentQuantity, 0) > 0
+    ORDER BY li.LotInventoryID DESC
+    LIMIT ?
+    OFFSET ?
+  `, [locationId, limit, offset]);
+
+  res.json({
+    location: {
+      LocationID: locationId,
+      pairedLocationId: pairing.pairedLocationId,
+      pairedLocationName: pairing.pairedLocationName,
+    },
+    lots: rows.map((row) => ({
+      LotInventoryID: Number(row.LotInventoryID),
+      LotReceiveID: row.LotReceiveID != null ? Number(row.LotReceiveID) : null,
+      PartNumber: row.PartNumber,
+      PartName: row.PartName || row.PartNumber,
+      CurrentInternalLot: row.CurrentInternalLot,
+      CurrentQuantity: Number(row.CurrentQuantity || 0),
+    })),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  });
 }));
 
 app.post('/api/scrap/requests/:requestId', asyncRoute(async (req, res) => {
@@ -3525,9 +3753,21 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     return res.status(400).json({ message: "El tipo de solicitud indicado no es válido." });
   }
 
+  // DestinationLocationID=0 es un valor válido y deliberado para solicitudes de scrap
+  // (sin ubicación física de destino), así que no se puede normalizar con `value ? ... : null`
+  // porque 0 es falsy en JS y terminaría convertido incorrectamente en null.
+  const normalizeLocationId = (value) => (value === undefined || value === null || value === '' ? null : Number(value));
+
   const isTransfer = parsedTypeId === 2;
-  let normalizedSourceLocationId = SourceLocationID ? Number(SourceLocationID) : null;
-  let normalizedDestinationLocationId = DestinationLocationID ? Number(DestinationLocationID) : null;
+  const isScrap = parsedTypeId === 6;
+  const requiresErpSync = isTransfer || isScrap;
+  let normalizedSourceLocationId = normalizeLocationId(SourceLocationID);
+  let normalizedDestinationLocationId = normalizeLocationId(DestinationLocationID);
+  // El destino de una solicitud de scrap nunca es configurable por el cliente: siempre es
+  // la ubicación "Confirmed Scrap" del catálogo, sin importar qué haya llegado en el body.
+  if (isScrap) {
+    normalizedDestinationLocationId = SCRAP_CONFIRMED_LOCATION_ID;
+  }
   let resolvedLotInventoryId = null;
 
   const hasLotInventoryId = LotInventoryID !== undefined && LotInventoryID !== null && LotInventoryID !== '';
@@ -3557,8 +3797,10 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
       return res.status(400).json({ message: 'Lote indicado no existe.' });
     }
 
-    // If no destination specified, default to Production location
-    if (!normalizedDestinationLocationId) {
+    // If no destination specified, default to Production location. `0` es el sentinel
+    // deliberado de scrap ("sin ubicación física de destino") y no debe confundirse con
+    // "no especificado" — de ahí la comparación explícita contra null en vez de truthiness.
+    if (normalizedDestinationLocationId === null) {
       const prodLoc = await findProductionLocation().catch(() => null);
       if (prodLoc) normalizedDestinationLocationId = Number(prodLoc);
     }
@@ -3800,6 +4042,9 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
   if (isTransfer && (!normalizedSourceLocationId || !normalizedDestinationLocationId)) {
     return res.status(400).json({ message: "Una transferencia requiere ubicación de origen y destino." });
   }
+  if (isScrap && !normalizedSourceLocationId) {
+    return res.status(400).json({ message: "Una solicitud de scrap requiere la ubicación de cuarentena de origen." });
+  }
 
   // Las transferencias que salen de Incoming (recepción) siempre deben mover el lote
   // completo — no se permiten transferencias parciales desde esa ubicación.
@@ -3854,7 +4099,7 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
   const requestId = insertResult.insertId;
   let erpResult = null;
 
-  if (isTransfer) {
+  if (requiresErpSync) {
     erpResult = await erpClient.createStockEntry(requestId);
     if (!erpResult.ok) {
       console.error(
@@ -3875,7 +4120,7 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     erp: erpResult
       ? { stockEntry: erpResult.data?.stock_entry, stockEntryType: erpResult.data?.stock_entry_type, message: erpResult.message }
       : null,
-    message: isTransfer
+    message: requiresErpSync
       ? `Solicitud #${requestId} creada y sincronizada con el MES Web correctamente.`
       : `Solicitud #${requestId} creada correctamente.`,
   });
@@ -3980,35 +4225,28 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
     return res.status(409).json({ message: "La solicitud debe estar aprobada (41) antes de ejecutar la transferencia." });
   }
 
-  const effectiveDestinationLocationId = Number(requestRow.DestinationLocationID || parsedDestinationLocationId || null) || null;
-  const isQuarantineDestination = effectiveDestinationLocationId != null
-    ? await (async () => {
-        const [locationRows] = await pool.query(
-          "SELECT LocationName FROM PLANT_LOCATIONS WHERE LocationID = ? LIMIT 1",
-          [effectiveDestinationLocationId]
-        );
-        const locationName = String(locationRows[0]?.LocationName || '').toLowerCase();
-        return [
-          'quarantine',
-          'quarentine',
-          'purg',
-          'cuarentena',
-          'purgue',
-        ].some((token) => locationName.includes(token));
-      })()
-    : false;
+  const requestTypeId = Number(requestRow.RequestTypeID);
+  const isScrapRequest = requestTypeId === 6;
 
-  if (effectiveDestinationLocationId == null) {
+  // El scrap usa DestinationLocationID=0 como sentinel deliberado ("sin ubicación física
+  // de destino"), así que no se puede normalizar con `value || fallback` porque 0 es falsy
+  // en JS y se perdería, cayendo incorrectamente en el error de "destino inválido".
+  const rawDestinationLocationId = requestRow.DestinationLocationID;
+  const effectiveDestinationLocationId = rawDestinationLocationId !== null && rawDestinationLocationId !== undefined
+    ? Number(rawDestinationLocationId)
+    : parsedDestinationLocationId;
+
+  if (!isScrapRequest && effectiveDestinationLocationId == null) {
     return res.status(400).json({ message: "Debe seleccionar una ubicación de destino válida." });
   }
 
   const partNumber = String(requestRow.PartNumber || '');
-  const requestTypeId = Number(requestRow.RequestTypeID);
   const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
 
   let storage = null;
   let lotInternalLot = null;
   let movementId = null;
+  let storageInventoryAdjustment = null;
 
   const connection = await pool.getConnection();
   try {
@@ -4061,24 +4299,42 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
       return res.status(409).json({ message: 'El lote no tiene cantidad disponible para transferir.' });
     }
 
-    const shouldValidateSourceLocation = !(requestTypeId === 6 && isQuarantineDestination);
-    if (shouldValidateSourceLocation && sourceLocationId !== null && lotRow.CurrentLocationID != null && Number(lotRow.CurrentLocationID) !== sourceLocationId) {
+    // Para scrap se valida siempre que el lote esté físicamente en la ubicación de
+    // cuarentena indicada como origen de la solicitud, antes de permitir la baja.
+    if (sourceLocationId !== null && lotRow.CurrentLocationID != null && Number(lotRow.CurrentLocationID) !== sourceLocationId) {
       await connection.rollback();
       return res.status(409).json({ message: 'El lote no está en la ubicación de origen indicada en la solicitud.' });
     }
 
     let destinationLocationId = effectiveDestinationLocationId;
 
-    if (destinationLocationId == null) {
+    if (!isScrapRequest && destinationLocationId == null) {
       await connection.rollback();
       return res.status(400).json({ message: 'No se pudo determinar una ubicación de destino para la transferencia.' });
     }
 
-    const isPartialOutbound = [3, 12].includes(requestTypeId);
+    // El scrap (destino sentinel 0) no mueve la ubicación física del lote: solo se
+    // descuenta CurrentQuantity (ver upsertInventoryFromLot). La transferencia parcial
+    // y el consumo (3, 12) tampoco mueven ubicación, solo descuentan cantidad.
+    const isPartialOutbound = [3, 6, 12].includes(requestTypeId);
     if (!isPartialOutbound) {
       await connection.query(
         'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
         [destinationLocationId, requestRow.LotInventoryID]
+      );
+    }
+
+    // Caso Storage -> Purgue: el lote deja de estar en su rack, así que la cantidad
+    // transferida se descuenta de MES_INVENTORY para ese rack (relación vía
+    // MES_LOT_INVENTORY.InventoryID, ya resuelta en `storage` por getStorageFromLot).
+    const isStorageToPurgue = requestTypeId === 2
+      && sourceLocationId === CYCLIC_COUNT_STORAGE_LOCATION_ID
+      && destinationLocationId === PURGUE_LOCATION_ID;
+    if (isStorageToPurgue && storage?.InventoryID) {
+      storageInventoryAdjustment = { inventoryId: Number(storage.InventoryID), quantity: parsedQty };
+      await connection.query(
+        'UPDATE MES_INVENTORY SET Quantity = Quantity - ?, LastUpdate = NOW() WHERE InventoryID = ?',
+        [parsedQty, storageInventoryAdjustment.inventoryId]
       );
     }
 
@@ -4190,6 +4446,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
         requestTypeId,
         lotInventoryId: requestRow.LotInventoryID,
         sourceLocationId,
+        extraInventoryAdjustment: storageInventoryAdjustment,
       });
       if (compensation.reversed) {
         await compConnection.query(
@@ -4307,8 +4564,9 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
   );
   const sourceLocationName = String(locationRows[0]?.SourceLocationName || '').toLowerCase();
   const destinationLocationName = String(locationRows[0]?.DestinationLocationName || '').toLowerCase();
-  if (!sourceLocationName.includes('incoming') || !/stor|almac/.test(destinationLocationName)) {
-    return res.status(409).json({ message: "Esta operación solo aplica a transferencias de Incoming a Storage." });
+  const isValidRackSelectionSource = sourceLocationName.includes('incoming') || sourceLocationName.includes('purg');
+  if (!isValidRackSelectionSource || !/stor|almac/.test(destinationLocationName)) {
+    return res.status(409).json({ message: "Esta operación solo aplica a transferencias de Incoming o Purgue hacia Storage." });
   }
 
   const [storageRows] = await pool.query("SELECT StorageID FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1", [parsedStorageId]);

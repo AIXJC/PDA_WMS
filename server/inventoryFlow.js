@@ -115,6 +115,9 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
     throw new Error(`Faltan datos requeridos para registrar el movimiento (${missing.join(', ')}), RequestID=${requestId}.`);
   }
 
+  const isScrap = Number(requestTypeId) === 6;
+  const movementTypeId = isScrap ? 6 : 2;
+
   const [movementResult] = await connection.query(`
     INSERT INTO INVENTORY_MOVEMENTS_HISTORY (
       RequestID, PartNumber, StorageID, Quantity, MovementTypeID,
@@ -126,7 +129,7 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
     normalizedPartNumber,
     rackLocationId,
     quantityToApply,
-    2,
+    movementTypeId,
     safeSourceLocationId,
     safeDestinationLocationId,
     safeUserId,
@@ -136,7 +139,25 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
     lotRow.CurrentInternalLot || null,
   ]);
 
-  return { applied: true, inventoryId, lotInventoryId: lotId, quantity: signedQuantity, movementId: movementResult.insertId };
+  const movementId = movementResult.insertId;
+
+  if (isScrap) {
+    await connection.query(`
+      INSERT INTO MES_SCRAP_AND_DISCREPANCIES (
+        PartNumber, Quantity, LocationID, RegUserID, Comments, MovementID, LotInventoryID
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [
+      normalizedPartNumber,
+      quantityToApply,
+      safeSourceLocationId,
+      safeUserId,
+      comments || 'Scrap confirmado desde solicitud aprobada',
+      movementId,
+      lotId,
+    ]);
+  }
+
+  return { applied: true, inventoryId, lotInventoryId: lotId, quantity: signedQuantity, movementId };
 }
 
 // Revierte el movimiento de inventario más reciente registrado para una solicitud,
@@ -144,7 +165,7 @@ async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, p
 // consumo, MovementTypeID=2) o la aprobación de scrap (MovementTypeID=6). Se usa
 // cuando la sincronización con el ERP (submit-stock-entry) falla después de que la
 // solicitud ya quedó marcada como ejecutada (RequestStatusID=42) en MES_DB.
-async function reverseSubmittedMovement(connection, { requestId, requestTypeId, lotInventoryId, sourceLocationId }) {
+async function reverseSubmittedMovement(connection, { requestId, requestTypeId, lotInventoryId, sourceLocationId, extraInventoryAdjustment }) {
   const [movementRows] = await connection.query(
     'SELECT MovementID, Quantity, MovementTypeID FROM INVENTORY_MOVEMENTS_HISTORY WHERE RequestID = ? ORDER BY MovementID DESC LIMIT 1 FOR UPDATE',
     [requestId]
@@ -154,19 +175,27 @@ async function reverseSubmittedMovement(connection, { requestId, requestTypeId, 
 
   const quantity = Number(movement.Quantity || 0);
   const isScrapMovement = Number(movement.MovementTypeID) === 6;
+  const typeId = Number(requestTypeId);
+  // Solo consumo, scrap y transferencia parcial (3, 6, 12) restan CurrentQuantity al
+  // aplicarse (ver el cálculo de `delta` en upsertInventoryFromLot); la transferencia
+  // completa (2) únicamente mueve CurrentLocationID y nunca toca la cantidad, así que
+  // revertirla no debe sumarla de vuelta — hacerlo duplicaría la cantidad del lote.
+  const quantityWasDeducted = [3, 6, 12].includes(typeId);
 
   if (!lotInventoryId) return { reversed: false, reason: 'lot_inventory_missing' };
 
-  await connection.query(
-    'UPDATE MES_LOT_INVENTORY SET CurrentQuantity = CurrentQuantity + ? WHERE LotInventoryID = ?',
-    [quantity, lotInventoryId]
-  );
+  if (quantityWasDeducted) {
+    await connection.query(
+      'UPDATE MES_LOT_INVENTORY SET CurrentQuantity = CurrentQuantity + ? WHERE LotInventoryID = ?',
+      [quantity, lotInventoryId]
+    );
+  }
 
   if (isScrapMovement) {
     await connection.query('DELETE FROM MES_SCRAP_AND_DISCREPANCIES WHERE MovementID = ?', [movement.MovementID]);
   } else {
     // Solo la transferencia completa (no la parcial/consumo) mueve la ubicación del lote.
-    if (Number(requestTypeId) === 2 && sourceLocationId != null) {
+    if (typeId === 2 && sourceLocationId != null) {
       await connection.query(
         'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
         [sourceLocationId, lotInventoryId]
@@ -178,12 +207,22 @@ async function reverseSubmittedMovement(connection, { requestId, requestTypeId, 
       [lotInventoryId]
     );
     const inventoryId = lotRows[0]?.InventoryID ?? null;
-    if (inventoryId) {
+    if (inventoryId && quantityWasDeducted) {
       await connection.query(
         'UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?',
         [quantity, inventoryId]
       );
     }
+  }
+
+  // Ajuste explícito fuera del cálculo genérico de arriba (p.ej. el descuento de
+  // MES_INVENTORY del rack de origen en una transferencia Storage → Purgue): se revierte
+  // sumando de vuelta la cantidad que se le restó al confirmar.
+  if (extraInventoryAdjustment && extraInventoryAdjustment.inventoryId) {
+    await connection.query(
+      'UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?',
+      [extraInventoryAdjustment.quantity, extraInventoryAdjustment.inventoryId]
+    );
   }
 
   await connection.query('DELETE FROM INVENTORY_MOVEMENTS_HISTORY WHERE MovementID = ?', [movement.MovementID]);
@@ -196,7 +235,8 @@ async function getStorageFromLot(connection, requestId) {
     SELECT
       sl.StorageID,
       req.PartNumber,
-      li.CurrentInternalLot
+      li.CurrentInternalLot,
+      inv.InventoryID
     FROM INVENTORY_REQUESTS req
     INNER JOIN MES_LOT_INVENTORY li
       ON li.LotInventoryID = req.LotInventoryID
