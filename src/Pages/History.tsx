@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowDownCircle, ArrowUpCircle, RefreshCw, Settings2, User, LoaderCircle, Calendar, Package, CheckCircle2, XCircle, Trash2 } from 'lucide-react';
+import { ArrowDownCircle, ArrowUpCircle, RefreshCw, Settings2, User, LoaderCircle, Calendar, Package, CheckCircle2, XCircle, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
 import { motion } from 'framer-motion';
@@ -36,6 +36,8 @@ export const HistoryPage: React.FC = () => {
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 10;
 
   const loadHistory = async (showLoading = true) => {
     try {
@@ -73,6 +75,13 @@ export const HistoryPage: React.FC = () => {
     if (filter === 'scrap') return h.type === 'scrap';
     return h.type === filter;
   });
+
+  useEffect(() => {
+    setPage(1);
+  }, [filter]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pagedItems = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   const formatDateTime = (value?: string) => {
     if (!value) return '—';
@@ -129,7 +138,7 @@ export const HistoryPage: React.FC = () => {
             </div>
           )}
 
-          {!loading && !error && filtered.map((item, index) => (
+          {!loading && !error && pagedItems.map((item, index) => (
             <motion.div
               key={item.id}
               initial={{ opacity: 0, x: -10 }}
@@ -137,7 +146,7 @@ export const HistoryPage: React.FC = () => {
               transition={{ delay: index * 0.05 }}
               className="relative pl-8 pb-6"
             >
-              {index < filtered.length - 1 && (
+              {index < pagedItems.length - 1 && (
                 <div className="absolute left-[11px] top-6 bottom-0 w-0.5 bg-slate-100 dark:bg-slate-700" />
               )}
 
@@ -243,8 +252,32 @@ export const HistoryPage: React.FC = () => {
             <div className="rounded-2xl border border-dashed border-slate-200 p-6 text-center text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
               <p className="font-semibold text-slate-700 dark:text-slate-200">No hay movimientos para este filtro.</p>
               <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
-                Si acabas de registrar una entrada o una merma, espera unos segundos y vuelve a cargar la pantalla.
+                Si acabas de registrar una entrada o un scrap, espera unos segundos y vuelve a cargar la pantalla.
               </p>
+            </div>
+          )}
+
+          {!loading && !error && filtered.length > 0 && (
+            <div className="mt-2 flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+              >
+                <ChevronLeft size={14} />
+                Anterior
+              </button>
+              <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">Página {page} de {totalPages}</span>
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page >= totalPages}
+                className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+              >
+                Siguiente
+                <ChevronRight size={14} />
+              </button>
             </div>
           )}
         </div>

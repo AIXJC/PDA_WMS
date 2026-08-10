@@ -117,6 +117,9 @@ export const Orders: React.FC = () => {
   const [dateFilter, setDateFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [inboundTab, setInboundTab] = useState<'approved' | 'pending'>('pending');
+  const [inboundSearch, setInboundSearch] = useState('');
+  const [inboundDateFrom, setInboundDateFrom] = useState('');
+  const [inboundDateTo, setInboundDateTo] = useState('');
   const [statusOptions, setStatusOptions] = useState<Array<any>>([]);
   const [outboundStatusOptions, setOutboundStatusOptions] = useState<string[]>([]);
   const requestedStatus = useMemo(() => new URLSearchParams(location.search).get('status') || '', [location.search]);
@@ -143,24 +146,16 @@ export const Orders: React.FC = () => {
     return 'pending';
   };
 
-  
-  const isInboundPending = (order: any) => {
-    const statusId = Number(order?.OrderStatusID ?? order?.RequestStatusID ?? 0);
-    if (statusId === 41) return true; // pendiente
-    if (statusId === 42) return false; // aprobada/ejecutada
 
-    const statusText = String(order?.StatusDescription || order?.StatusCode || '').toLowerCase();
-    return statusText.includes('pendiente') || statusText.includes('pending') || statusText.includes('draft');
-  };
-
-  const inboundPendingOrders = orders.filter((order) => Number(order?.OrderStatusID ?? order?.RequestStatusID ?? 0) === 41);
-  const inboundApprovedOrders = orders.filter((order) => Number(order?.OrderStatusID ?? order?.RequestStatusID ?? 0) === 42);
+  // El backend (/api/requests/inbound) ya filtra por estado según inboundTab
+  // (pending -> 40, approved -> 41), así que `orders` refleja directamente la
+  // pestaña seleccionada; no hace falta volver a filtrar aquí.
 
   const isOutbound = type === 'outbound';
   const title = isOutbound ? 'Órdenes de Salida' : 'Órdenes de Entrada';
 
   // No auto-fallback from approved to pending; the user should remain in the selected tab
-  // so they can see that there are no status 42 orders if none are available.
+  // so they can see that there are no approved (41) orders if none are available.
   useEffect(() => {
     if (isOutbound) return;
   }, [isOutbound]);
@@ -168,7 +163,7 @@ export const Orders: React.FC = () => {
   useEffect(() => {
     // initial load or reload when filters/tab change
     void loadInboundOrders(true);
-  }, [isOutbound, providerFilter, poFilter, dateFilter, statusFilter, inboundTab]);
+  }, [isOutbound, inboundTab, inboundSearch, inboundDateFrom, inboundDateTo]);
   const searchParams = new URLSearchParams(location.search);
   const requestedView = searchParams.get('view');
   const requestedPo = searchParams.get('po');
@@ -262,10 +257,10 @@ export const Orders: React.FC = () => {
       const params = new URLSearchParams();
       params.set('limit', String(PAGE_SIZE));
       params.set('offset', String(currentOffset));
-      const statusParam = statusFilter || requestedStatus;
-      if (statusParam) {
-        params.set('status', statusParam);
-      }
+      params.set('status', inboundTab);
+      if (inboundSearch.trim()) params.set('search', inboundSearch.trim());
+      if (inboundDateFrom) params.set('dateFrom', inboundDateFrom);
+      if (inboundDateTo) params.set('dateTo', inboundDateTo);
 
       const response = await fetch(`/api/requests/inbound?${params.toString()}`);
       if (!response.ok) throw new Error('No fue posible cargar las entradas');
@@ -710,7 +705,7 @@ export const Orders: React.FC = () => {
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">Órdenes de entrada</p>
-                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Filtra por aprobadas o pendientes</p>
+                <p className="mt-1 text-sm font-black text-slate-900 dark:text-slate-100">Histórico de Incoming → Storage</p>
               </div>
               <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/80">
                 <button
@@ -730,8 +725,33 @@ export const Orders: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-black uppercase tracking-widest text-slate-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300">
-                <span>{inboundTab === 'approved' ? 'Historial de transferencias' : 'Órdenes pendientes'}</span>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <input
+                type="text"
+                value={inboundSearch}
+                onChange={(e) => setInboundSearch(e.target.value)}
+                placeholder="Buscar por número o nombre de parte"
+                className="sm:col-span-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-100"
+              />
+              <input
+                type="date"
+                value={inboundDateFrom}
+                onChange={(e) => setInboundDateFrom(e.target.value)}
+                placeholder="Desde"
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-100"
+              />
+              <input
+                type="date"
+                value={inboundDateTo}
+                onChange={(e) => setInboundDateTo(e.target.value)}
+                placeholder="Hasta"
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="mt-3 flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-black uppercase tracking-widest text-slate-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300">
+                <span>{inboundTab === 'approved' ? 'Aprobadas por el MES Web' : 'Pendientes de aprobación'}</span>
+                <span className="text-[10px] font-bold normal-case tracking-normal text-slate-400">{orders.length} mostradas</span>
             </div>
 
             <div className="mt-4 space-y-3">
@@ -740,13 +760,13 @@ export const Orders: React.FC = () => {
                   Cargando órdenes...
                 </div>
               ) : (
-                (inboundTab === 'approved' ? inboundApprovedOrders : inboundPendingOrders).length === 0 ? (
+                orders.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-300">
                     No hay órdenes {inboundTab === 'approved' ? 'aprobadas' : 'pendientes'} para mostrar.
                   </div>
                 ) : (
                   <>
-                    {(inboundTab === 'approved' ? inboundApprovedOrders : inboundPendingOrders).map((order) => (
+                    {orders.map((order) => (
                       <button
                         key={order.PurchaseOrderID}
                         type="button"
@@ -756,19 +776,20 @@ export const Orders: React.FC = () => {
                         <div className="flex items-start justify-between gap-3">
                           <div>
                             <p className="text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-300">{order.PONumber || order.PurchaseOrderID}</p>
-                            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{order.ProviderName || `Proveedor ${order.ProviderID}`}</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{order.PartNumber || 'Sin producto'}{order.ProviderName ? ` - ${order.ProviderName}` : ''}</p>
                             {order.LotReceiveID ? (
                               <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Lote: {order.LotReceiveID}{order.LotInventoryID ? ` • Inventario ${order.LotInventoryID}` : ''}</p>
                             ) : null}
-                            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Solo se pueden ver los detalles desde aquí, la recepción real se hace desde el escaneo del lote.</p>
+                            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                              {order.OrderDate ? new Date(order.OrderDate).toLocaleString('es-MX', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Sin fecha'}
+                            </p>
                           </div>
                           <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:bg-slate-700 dark:text-slate-300">
                             {inboundTab === 'approved' ? 'Aprobada' : 'Pendiente'}
                           </span>
                         </div>
                         <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                          <span>Recibido: {order.receivedQty ?? 0}</span>
-                          <span>Esperado: {order.orderedQty ?? 0}</span>
+                          <span>Cantidad: {order.orderedQty ?? order.Quantity ?? 0}</span>
                         </div>
                       </button>
                     ))}

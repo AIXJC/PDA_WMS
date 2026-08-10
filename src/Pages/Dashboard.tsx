@@ -26,7 +26,6 @@ const modules = (t: (k: string) => string) => [
   { id: 'requests', label: t('dashboard.requests'), icon: FileText, color: 'bg-indigo-500', path: '/requests' },
   { id: 'cyclic', label: t('dashboard.cyclic'), icon: RefreshCw, color: 'bg-cyan-500', path: '/inventory/cyclic' },
   { id: 'transfers', label: t('dashboard.transfers'), icon: MoveHorizontal, color: 'bg-violet-500', path: '/transfers' },
-  { id: 'adjustments', label: t('dashboard.damage'), icon: Settings2, color: 'bg-slate-500', path: '/adjustments' },
   { id: 'history', label: t('dashboard.history'), icon: History, color: 'bg-slate-700', path: '/history' },
 ];
 

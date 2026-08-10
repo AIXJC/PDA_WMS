@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
-import { Check, ArrowRight, X, Box } from 'lucide-react';
+import { Check, ArrowRight, X, Box, ChevronLeft, ChevronRight } from 'lucide-react';
 import useAuthStore from '../store/useAuthStore';
 import { motion } from 'framer-motion';
 import { useLocation } from 'react-router-dom';
@@ -60,6 +60,8 @@ export const Transfers: React.FC = () => {
   const [selectedStorageLocation, setSelectedStorageLocation] = useState<StorageLocation | null>(null);
   const [rackCodeInput, setRackCodeInput] = useState('');
   const [completingRack, setCompletingRack] = useState<number | null>(null);
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 10;
 
   useEffect(() => { void load(); }, []);
 
@@ -180,6 +182,7 @@ export const Transfers: React.FC = () => {
       const d = await r.json();
       const nextRequests = ((d.requests || []) as Req[]).filter((req) => [2, 3, 12].includes(Number(req.RequestTypeID || 0)));
       setRequests(nextRequests);
+      if (showLoading) setPage(1);
       await loadLotTraceability(nextRequests);
     } catch (e) {
       console.error(e);
@@ -200,6 +203,9 @@ export const Transfers: React.FC = () => {
   const isQuarantineDestination = currentRequest?.DestinationLocationID
     ? isScrapOrQuarantineLocation(locationNames[currentRequest.DestinationLocationID] || '')
     : false;
+
+  const totalPages = Math.max(1, Math.ceil(requests.length / PAGE_SIZE));
+  const pagedRequests = requests.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   async function execute(req: Req) {
     setCurrentRequest(req);
@@ -390,7 +396,7 @@ export const Transfers: React.FC = () => {
             <button onClick={() => window.location.href = '/requests'} className="text-xs text-slate-500 underline">Ir a Solicitudes</button>
           </div>
         ) : (
-          requests.map((r) => (
+          pagedRequests.map((r) => (
             <div key={r.RequestID} className="w-full overflow-hidden rounded-[1.5rem] border border-slate-200 bg-gradient-to-br from-white to-slate-50 p-4 shadow-sm dark:border-slate-700 dark:from-slate-800/95 dark:to-slate-900/90">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0 flex-1 space-y-3">
@@ -473,6 +479,30 @@ export const Transfers: React.FC = () => {
               </div>
             </div>
           ))
+        )}
+
+        {!loading && requests.length > 0 && (
+          <div className="flex items-center justify-between pt-2">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+            >
+              <ChevronLeft size={14} />
+              Anterior
+            </button>
+            <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">Página {page} de {totalPages}</span>
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+              className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+            >
+              Siguiente
+              <ChevronRight size={14} />
+            </button>
+          </div>
         )}
       </div>
 
