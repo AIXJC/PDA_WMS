@@ -11,8 +11,7 @@ import {
   X,
   LogOut,
   Wifi,
-  WifiOff,
-  User
+  WifiOff
 } from 'lucide-react';
 import useAuthStore from '../store/useAuthStore';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -82,11 +81,6 @@ export const Layout: React.FC<LayoutProps> = ({ children, title, showNav = true 
                 {title || 'Dashboard'}
               </h1>
             </div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0 ml-2">
-          <div className="bg-slate-800 p-2 rounded-full">
-            <User size={20} className="text-slate-200" />
           </div>
         </div>
       </header>

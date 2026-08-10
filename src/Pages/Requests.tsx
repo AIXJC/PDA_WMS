@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
-import { FileText, Plus, Check, X, Clock, ChevronRight, User, RefreshCw } from 'lucide-react';
+import { FileText, Plus, Check, X, Clock, ChevronRight, ChevronLeft, User, RefreshCw } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -77,6 +77,8 @@ export const Requests: React.FC = () => {
   const [lotInventoryOptions, setLotInventoryOptions] = useState<LotInventoryOption[]>([]);
   const [lotSearchText, setLotSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | '40' | '41' | '42'>('all');
+  const [groupPage, setGroupPage] = useState<Record<number, number>>({});
+  const REQUESTS_PAGE_SIZE = 5;
   const lotSearchInputRef = useRef<HTMLInputElement | null>(null);
   const lotSearchTimeoutRef = useRef<number | null>(null);
   const [form, setForm] = useState<RequestFormState>({
@@ -96,6 +98,10 @@ export const Requests: React.FC = () => {
   useEffect(() => {
     void loadRequests();
   }, []);
+
+  useEffect(() => {
+    setGroupPage({});
+  }, [statusFilter]);
 
   useEffect(() => {
     if (showCreate && (form.RequestTypeID === '2' || form.RequestTypeID === '3' || form.RequestTypeID === '12')) {
@@ -812,6 +818,9 @@ export const Requests: React.FC = () => {
                 {visibleGroups.map((group) => {
                   const items = requests.filter((req) => Number(req.RequestStatusID || 0) === group.id);
                   const shouldShowEmptyState = items.length === 0;
+                  const currentGroupPage = groupPage[group.id] || 1;
+                  const totalGroupPages = Math.max(1, Math.ceil(items.length / REQUESTS_PAGE_SIZE));
+                  const pagedItems = items.slice((currentGroupPage - 1) * REQUESTS_PAGE_SIZE, currentGroupPage * REQUESTS_PAGE_SIZE);
                   return (
                     <div key={group.id} className="rounded-[2rem] border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
                       <div className="mb-3 flex items-center justify-between">
@@ -830,7 +839,7 @@ export const Requests: React.FC = () => {
                         </div>
                       ) : (
                         <div className="space-y-2">
-                          {items.map((req, index) => {
+                          {pagedItems.map((req, index) => {
                             const statusMeta = getStatusMeta(req.RequestStatusID);
                             const StatusIcon = statusMeta.icon;
                             const qty = Number(req.Quantity || 0);
@@ -890,6 +899,30 @@ export const Requests: React.FC = () => {
                           })}
                         </div>
                       )}
+
+                      {items.length > REQUESTS_PAGE_SIZE ? (
+                        <div className="mt-3 flex items-center justify-between">
+                          <button
+                            type="button"
+                            onClick={() => setGroupPage((prev) => ({ ...prev, [group.id]: Math.max(1, currentGroupPage - 1) }))}
+                            disabled={currentGroupPage <= 1}
+                            className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-[10px] font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                          >
+                            <ChevronLeft size={12} />
+                            Anterior
+                          </button>
+                          <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400">Página {currentGroupPage} de {totalGroupPages}</span>
+                          <button
+                            type="button"
+                            onClick={() => setGroupPage((prev) => ({ ...prev, [group.id]: Math.min(totalGroupPages, currentGroupPage + 1) }))}
+                            disabled={currentGroupPage >= totalGroupPages}
+                            className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-[10px] font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                          >
+                            Siguiente
+                            <ChevronRight size={12} />
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
                   );
                 })}

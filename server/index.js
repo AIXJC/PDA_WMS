@@ -2971,11 +2971,13 @@ app.get("/api/requests/inbound", asyncRoute(async (req, res) => {
   const normalizedStatus = statusQuery.toLowerCase();
   let statusId = null;
 
+  // Pendiente = solicitud creada y aún no aprobada por el MES Web (40).
+  // Aprobada = ya aprobada por el MES Web, lista para transferir (41).
   if (normalizedStatus) {
     if (normalizedStatus === 'pending' || normalizedStatus.includes('pend')) {
-      statusId = 41;
+      statusId = 40;
     } else if (normalizedStatus === 'approved' || normalizedStatus.includes('approv')) {
-      statusId = 42;
+      statusId = 41;
     } else {
       const resolved = getOrderStatusIdByKey(statusQuery, null);
       if (Number.isFinite(Number(resolved))) {
@@ -2984,9 +2986,13 @@ app.get("/api/requests/inbound", asyncRoute(async (req, res) => {
     }
   }
 
+  const search = String(req.query.search || '').trim();
+  const dateFrom = String(req.query.dateFrom || '').trim();
+  const dateTo = String(req.query.dateTo || '').trim();
+
   const params = [];
   const clauses = [
-    'req.RequestStatusID IN (41, 42)',
+    'req.RequestStatusID IN (40, 41)',
     'req.RequestTypeID IN (2, 12)',
     'req.LotInventoryID IS NOT NULL',
     'req.LotInventoryID > 0',
@@ -2997,6 +3003,18 @@ app.get("/api/requests/inbound", asyncRoute(async (req, res) => {
   if (Number.isFinite(Number(statusId))) {
     clauses.push('req.RequestStatusID = ?');
     params.push(statusId);
+  }
+  if (search) {
+    clauses.push('(req.PartNumber LIKE ? OR item.PartName LIKE ? OR req.RequestName LIKE ?)');
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+  }
+  if (dateFrom) {
+    clauses.push('COALESCE(req.SubmitDate, req.RegDate) >= ?');
+    params.push(`${dateFrom} 00:00:00`);
+  }
+  if (dateTo) {
+    clauses.push('COALESCE(req.SubmitDate, req.RegDate) <= ?');
+    params.push(`${dateTo} 23:59:59`);
   }
 
   const rows = await query(`
@@ -3030,7 +3048,7 @@ app.get("/api/requests/inbound", asyncRoute(async (req, res) => {
     LEFT JOIN PLANT_LOCATIONS dest ON dest.LocationID = req.DestinationLocationID
     LEFT JOIN MES_LOT_INVENTORY li ON li.LotInventoryID = req.LotInventoryID
     WHERE ${clauses.join(' AND\n      ')}
-    ORDER BY req.SubmitDate DESC, req.RequestID DESC
+    ORDER BY COALESCE(req.SubmitDate, req.RegDate) DESC, req.RequestID DESC
     LIMIT ? OFFSET ?
   `, [...params, limit, offset]);
 
