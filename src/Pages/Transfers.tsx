@@ -62,6 +62,7 @@ export const Transfers: React.FC = () => {
   const [completingRack, setCompletingRack] = useState<number | null>(null);
   const [page, setPage] = useState(1);
   const PAGE_SIZE = 10;
+  const [quarantineLocationIds, setQuarantineLocationIds] = useState<Set<number>>(new Set());
 
   useEffect(() => { void load(); }, []);
 
@@ -124,6 +125,20 @@ export const Transfers: React.FC = () => {
     }
   }
 
+  // Identifica ubicaciones de cuarentena (terminación "10", p.ej. Purgue) por ID en vez de
+  // por nombre — una devolución desde cualquier cuarentena hacia su almacén base pareado
+  // debe pasar por el selector de rack, no solo cuando el nombre contiene literalmente "purg".
+  async function loadQuarantineLocationIds() {
+    try {
+      const r = await fetch('/api/scrap/quarantine-locations');
+      const d = await r.json();
+      const ids = Array.isArray(d.locations) ? d.locations.map((loc: any) => Number(loc.LocationID)) : [];
+      setQuarantineLocationIds(new Set(ids));
+    } catch (e) {
+      console.error('Error loading quarantine location ids', e);
+    }
+  }
+
   async function loadLotTraceability(requestList: Req[]) {
     const uniqueParts = Array.from(new Set(requestList.map((request) => String(request.PartNumber || '').trim()).filter(Boolean)));
     if (uniqueParts.length === 0) {
@@ -176,7 +191,7 @@ export const Transfers: React.FC = () => {
       setLoading(true);
     }
     try {
-      await loadLocationNames();
+      await Promise.all([loadLocationNames(), loadQuarantineLocationIds()]);
       // Solo se ejecutan transferencias ya aprobadas por el ERP (estado 41) y de tipos transferibles para salidas/transferencias
       const r = await fetch('/api/requests?status=41');
       const d = await r.json();
@@ -233,7 +248,8 @@ export const Transfers: React.FC = () => {
     if (Number(req.RequestTypeID) !== 2) return false;
     const sourceName = req.SourceLocationID ? String(locationNames[req.SourceLocationID] || '').toLowerCase() : '';
     const destinationName = req.DestinationLocationID ? String(locationNames[req.DestinationLocationID] || '').toLowerCase() : '';
-    return (sourceName.includes('incoming') || sourceName.includes('purg')) && /stor|almac/.test(destinationName);
+    const sourceIsQuarantine = req.SourceLocationID ? quarantineLocationIds.has(Number(req.SourceLocationID)) : false;
+    return (sourceName.includes('incoming') || sourceIsQuarantine) && /stor|almac/.test(destinationName);
   };
 
   const getStorageLocationCode = (location: StorageLocation) => {
@@ -583,15 +599,50 @@ export const Transfers: React.FC = () => {
 
             <div className="mt-4 space-y-2">
               <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-1">Cantidad a descontar</label>
-              <input
-                type="number"
-                min="0.0001"
-                step="any"
-                value={quantityInput}
-                readOnly
-                className="w-full bg-slate-100 dark:bg-slate-700 border-2 border-slate-200 dark:border-slate-600 rounded-xl py-3 px-4 font-medium text-slate-900 dark:text-slate-100 cursor-not-allowed"
-              />
-              <p className="text-xs text-slate-500 dark:text-slate-400">Se usa la cantidad registrada en la solicitud. No cambia la ubicación del lote cuando es una salida parcial.</p>
+              {isScrapRequest(currentRequest) ? (
+                (() => {
+                  const maxQty = currentRequest
+                    ? (defaultTransferQtyByRequest[currentRequest.RequestID] ?? Number(currentRequest.Quantity || 0))
+                    : 0;
+                  const currentQty = Number(quantityInput) || 0;
+                  return (
+                    <>
+                      <div className="flex items-center gap-4 bg-slate-50 dark:bg-slate-900/70 p-2 rounded-2xl">
+                        <button
+                          type="button"
+                          onClick={() => setQuantityInput(String(Math.max(1, currentQty - 1)))}
+                          className="w-12 h-12 bg-white dark:bg-slate-700 rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-200 font-black text-xl active:scale-90 transition-all"
+                        >
+                          -
+                        </button>
+                        <div className="flex-1 text-center text-xl font-black text-slate-900 dark:text-slate-100">{currentQty}</div>
+                        <button
+                          type="button"
+                          onClick={() => setQuantityInput(String(Math.min(maxQty || currentQty, currentQty + 1)))}
+                          className="w-12 h-12 bg-white dark:bg-slate-700 rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-200 font-black text-xl active:scale-90 transition-all"
+                        >
+                          +
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        La inspección de calidad puede determinar una baja parcial. Máximo disponible: {maxQty}.
+                      </p>
+                    </>
+                  );
+                })()
+              ) : (
+                <>
+                  <input
+                    type="number"
+                    min="0.0001"
+                    step="any"
+                    value={quantityInput}
+                    readOnly
+                    className="w-full bg-slate-100 dark:bg-slate-700 border-2 border-slate-200 dark:border-slate-600 rounded-xl py-3 px-4 font-medium text-slate-900 dark:text-slate-100 cursor-not-allowed"
+                  />
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Se usa la cantidad registrada en la solicitud. No cambia la ubicación del lote cuando es una salida parcial.</p>
+                </>
+              )}
             </div>
 
             <div className="mt-6 flex gap-3">

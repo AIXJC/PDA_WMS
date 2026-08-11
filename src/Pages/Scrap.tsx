@@ -319,7 +319,7 @@ export const Scrap: React.FC = () => {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.message || 'No se pudo crear la solicitud de transferencia.');
-      setSuccessMessage(`Solicitud de transferencia #${body.requestId} creada y sincronizada con ERPNext. Queda pendiente de aprobación.`);
+      setSuccessMessage(`Solicitud de transferencia #${body.requestId} creada y sincronizada con el MES WEB. Queda pendiente de aprobación.`);
       notifyAppRefresh('action');
       setStep('success');
     } catch (err) {
@@ -358,7 +358,7 @@ export const Scrap: React.FC = () => {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.message || 'No se pudo crear la solicitud de devolución.');
-      setSuccessMessage(`Solicitud de devolución #${body.requestId} creada y sincronizada con ERPNext. Queda pendiente de aprobación.`);
+      setSuccessMessage(`Solicitud de devolución #${body.requestId} creada y sincronizada con el MES WEB. Queda pendiente de aprobación.`);
       notifyAppRefresh('action');
       setStep('success');
     } catch (err) {
@@ -404,7 +404,7 @@ export const Scrap: React.FC = () => {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.message || 'No se pudo crear la solicitud de baja.');
-      setSuccessMessage(`Solicitud de baja #${body.requestId} creada y sincronizada con ERPNext. Queda pendiente de aprobación.`);
+      setSuccessMessage(`Solicitud de baja #${body.requestId} creada y sincronizada con el MES WEB. Queda pendiente de aprobación.`);
       notifyAppRefresh('action');
       setStep('success');
     } catch (err) {
@@ -669,22 +669,10 @@ export const Scrap: React.FC = () => {
 
               <div className="space-y-2">
                 <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-2">{t('scrap.damagedQuantity')}</label>
-                <div className="flex items-center gap-4 bg-slate-50 dark:bg-slate-900/70 p-2 rounded-2xl">
-                  <button
-                    onClick={() => setTransferQuantity((q) => Math.max(1, q - 1))}
-                    className="w-12 h-12 bg-white dark:bg-slate-700 rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-200 font-black text-xl active:scale-90 transition-all"
-                  >
-                    -
-                  </button>
-                  <div className="flex-1 text-center text-xl font-black text-slate-900 dark:text-slate-100">{transferQuantity}</div>
-                  <button
-                    onClick={() => setTransferQuantity((q) => Math.min(lookupResult.lot.CurrentQuantity, q + 1))}
-                    className="w-12 h-12 bg-white dark:bg-slate-700 rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-200 font-black text-xl active:scale-90 transition-all"
-                  >
-                    +
-                  </button>
+                <div className="flex items-center justify-center bg-slate-50 dark:bg-slate-900/70 p-4 rounded-2xl">
+                  <div className="text-center text-xl font-black text-slate-900 dark:text-slate-100">{lookupResult.lot.CurrentQuantity}</div>
                 </div>
-                <p className="text-[10px] text-slate-500 dark:text-slate-400">Máximo disponible: {lookupResult.lot.CurrentQuantity}</p>
+                <p className="text-[10px] text-slate-500 dark:text-slate-400">Se transfiere el lote completo a cuarentena (no se permiten transferencias parciales).</p>
               </div>
 
               <div className="space-y-2">

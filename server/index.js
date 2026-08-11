@@ -4074,6 +4074,31 @@ app.post("/api/requests", asyncRoute(async (req, res) => {
     }
   }
 
+  // Las transferencias cuyo destino es una ubicación de cuarentena (terminación "10",
+  // p.ej. mover un lote a cuarentena/purgue antes de inspección) también deben mover el
+  // lote completo, sin importar el origen — igual que Incoming, pero evaluado por destino.
+  let isQuarantineDestinationTransfer = false;
+  if (isTransfer && !isIncomingSourceTransfer && normalizedDestinationLocationId != null) {
+    const { pairingByLocationId } = await getQuarantinePairing();
+    const destinationPairing = pairingByLocationId.get(normalizedDestinationLocationId);
+    isQuarantineDestinationTransfer = Boolean(destinationPairing?.isQuarantine);
+
+    if (isQuarantineDestinationTransfer) {
+      if (!Number.isInteger(resolvedLotInventoryId) || resolvedLotInventoryId <= 0) {
+        return res.status(400).json({ message: "Una transferencia a cuarentena requiere un lote de inventario válido." });
+      }
+      const [lotQtyRows] = await pool.query(
+        "SELECT CurrentQuantity FROM MES_LOT_INVENTORY WHERE LotInventoryID = ? LIMIT 1",
+        [resolvedLotInventoryId]
+      );
+      const lotFullQuantity = Number(lotQtyRows[0]?.CurrentQuantity || 0);
+      if (!(lotFullQuantity > 0)) {
+        return res.status(409).json({ message: "El lote no tiene cantidad disponible para transferir." });
+      }
+      effectiveQty = lotFullQuantity;
+    }
+  }
+
   // El ERP valida el request_id releyendo la fila desde la misma base de datos con su
   // propia conexión, así que el INSERT debe quedar comprometido (COMMIT) ANTES de
   // llamarlo — de lo contrario el ERP no puede ver una fila todavía no confirmada y
@@ -4564,9 +4589,17 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
   );
   const sourceLocationName = String(locationRows[0]?.SourceLocationName || '').toLowerCase();
   const destinationLocationName = String(locationRows[0]?.DestinationLocationName || '').toLowerCase();
-  const isValidRackSelectionSource = sourceLocationName.includes('incoming') || sourceLocationName.includes('purg');
+  const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
+  // Cualquier ubicación de cuarentena (terminación "10", p.ej. Purgue) que devuelve
+  // material a su almacén base pareado también pasa por aquí — no solo Purgue por nombre.
+  // Reutiliza el mismo emparejamiento numérico que ya usa el navegador de cuarentena de
+  // Scrap, en vez de depender de que el nombre contenga literalmente "purg".
+  const { pairingByLocationId } = await getQuarantinePairing();
+  const sourcePairing = sourceLocationId != null ? pairingByLocationId.get(sourceLocationId) : null;
+  const isQuarantineReturnSource = Boolean(sourcePairing?.isQuarantine);
+  const isValidRackSelectionSource = sourceLocationName.includes('incoming') || isQuarantineReturnSource;
   if (!isValidRackSelectionSource || !/stor|almac/.test(destinationLocationName)) {
-    return res.status(409).json({ message: "Esta operación solo aplica a transferencias de Incoming o Purgue hacia Storage." });
+    return res.status(409).json({ message: "Esta operación solo aplica a transferencias de Incoming o desde cuarentena hacia Storage." });
   }
 
   const [storageRows] = await pool.query("SELECT StorageID FROM STORAGE_LOCATIONS WHERE StorageID = ? LIMIT 1", [parsedStorageId]);
@@ -4575,7 +4608,6 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
   }
 
   const partNumber = String(requestRow.PartNumber || '').trim();
-  const sourceLocationId = requestRow.SourceLocationID ? Number(requestRow.SourceLocationID) : null;
   const lotInventoryId = Number(requestRow.LotInventoryID);
 
   let quantity = 0;
@@ -4618,11 +4650,13 @@ app.post("/api/requests/:id(\\d+)/complete-storage-transfer", asyncRoute(async (
     let inventoryId;
     if (existingInventoryRows[0]) {
       inventoryId = Number(existingInventoryRows[0].InventoryID);
+      console.log(`[complete-storage-transfer] requestId=${requestId} rack ${parsedStorageId} ya tiene registro MES_INVENTORY.InventoryID=${inventoryId}, sumando cantidad ${quantity}`);
       await connection.query(
         'UPDATE MES_INVENTORY SET Quantity = Quantity + ?, LastUpdate = NOW() WHERE InventoryID = ?',
         [quantity, inventoryId]
       );
     } else {
+      console.log(`[complete-storage-transfer] requestId=${requestId} rack ${parsedStorageId} no tiene registro MES_INVENTORY, creando nuevo registro con cantidad ${quantity}`);
       const [insertInventoryResult] = await connection.query(
         'INSERT INTO MES_INVENTORY (PartNumber, RackLocationID, Quantity, LastUpdate) VALUES (?, ?, ?, NOW())',
         [partNumber, parsedStorageId, quantity]
