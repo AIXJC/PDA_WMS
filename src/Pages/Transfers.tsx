@@ -236,6 +236,17 @@ export const Transfers: React.FC = () => {
     return locationNames[locationId] || `#${locationId}`;
   };
 
+  // Cualquier transferencia completa cuyo destino sea Storage requiere elegir un rack
+  // físico (reutiliza el mismo modal y el mismo endpoint complete-storage-transfer,
+  // que ya acepta Incoming o Purgue como origen).
+  const requiresRackSelection = (req: Req) => {
+    if (Number(req.RequestTypeID) !== 2) return false;
+    const sourceName = req.SourceLocationID ? String(locationNames[req.SourceLocationID] || '').toLowerCase() : '';
+    const destinationName = req.DestinationLocationID ? String(locationNames[req.DestinationLocationID] || '').toLowerCase() : '';
+    const sourceIsQuarantine = req.SourceLocationID ? quarantineLocationIds.has(Number(req.SourceLocationID)) : false;
+    return (sourceName.includes('incoming') || sourceIsQuarantine) && /stor|almac/.test(destinationName);
+  };
+
   // Agrupa cada solicitud por lo que representa físicamente para el operador, no solo
   // por RequestTypeID crudo: una transferencia completa (2) puede ir hacia Storage
   // (Incoming/cuarentena -> almacén) o hacia cuarentena (almacén -> Purgue), y son
@@ -275,17 +286,6 @@ export const Transfers: React.FC = () => {
     const defaultQty = defaultTransferQtyByRequest[req.RequestID] ?? Number(req.Quantity || 0);
     setQuantityInput(String(defaultQty));
   }
-
-  // Cualquier transferencia completa cuyo destino sea Storage requiere elegir un rack
-  // físico (reutiliza el mismo modal y el mismo endpoint complete-storage-transfer,
-  // que ya acepta Incoming o Purgue como origen).
-  const requiresRackSelection = (req: Req) => {
-    if (Number(req.RequestTypeID) !== 2) return false;
-    const sourceName = req.SourceLocationID ? String(locationNames[req.SourceLocationID] || '').toLowerCase() : '';
-    const destinationName = req.DestinationLocationID ? String(locationNames[req.DestinationLocationID] || '').toLowerCase() : '';
-    const sourceIsQuarantine = req.SourceLocationID ? quarantineLocationIds.has(Number(req.SourceLocationID)) : false;
-    return (sourceName.includes('incoming') || sourceIsQuarantine) && /stor|almac/.test(destinationName);
-  };
 
   const getStorageLocationCode = (location: StorageLocation) => {
     const rackName = String(location?.RackName || '').trim().toUpperCase();
