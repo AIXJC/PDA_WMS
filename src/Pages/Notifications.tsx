@@ -2,6 +2,7 @@ import React from 'react';
 import { Bell, Check, AlertCircle, Clock, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
+import { API_BASE_URL } from '../utils/apiBase';
 
 const CLEARED_AT_STORAGE_KEY = 'pda-notifications-cleared-at';
 const PAGE_SIZE = 10;
@@ -28,7 +29,7 @@ export const Notifications: React.FC = () => {
     const loadNotifications = async () => {
       setLoading(true);
       try {
-        const response = await fetch('/api/notifications?limit=100');
+        const response = await fetch(`${API_BASE_URL}/api/notifications?limit=100`);
         if (!response.ok) throw new Error('No fue posible cargar las notificaciones');
         const data = await response.json();
         setNotifications(Array.isArray(data.notifications) ? data.notifications : []);

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Scan, 
+import { API_BASE_URL } from '../utils/apiBase';
+import {
+  Scan,
   X, 
   Zap, 
   History, 
@@ -149,7 +150,7 @@ export const Scanner: React.FC = () => {
   const handleDetected = async (code: string) => {
     // call backend scanner endpoint to get product info
     try {
-      const resp = await fetch(`/api/scanner/${encodeURIComponent(code)}`);
+      const resp = await fetch(`${API_BASE_URL}/api/scanner/${encodeURIComponent(code)}`);
       const data = await resp.json();
       if (data && data.found) {
         // prefer inventory first

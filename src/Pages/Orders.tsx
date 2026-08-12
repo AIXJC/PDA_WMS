@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { API_BASE_URL } from '../utils/apiBase';
 import {
   ArrowDownCircle,
   ArrowUpCircle,
@@ -223,7 +224,7 @@ export const Orders: React.FC = () => {
     // load MES_STATUS options for UI filters (async IIFE)
     (async () => {
       try {
-        const cfg = await fetch('/api/settings/catalogs');
+        const cfg = await fetch(`${API_BASE_URL}/api/settings/catalogs`);
         if (cfg.ok) {
           const cfgData = await cfg.json();
           const allStatuses = Array.isArray(cfgData.statuses) ? cfgData.statuses : [];
@@ -262,7 +263,7 @@ export const Orders: React.FC = () => {
       if (inboundDateFrom) params.set('dateFrom', inboundDateFrom);
       if (inboundDateTo) params.set('dateTo', inboundDateTo);
 
-      const response = await fetch(`/api/requests/inbound?${params.toString()}`);
+      const response = await fetch(`${API_BASE_URL}/api/requests/inbound?${params.toString()}`);
       if (!response.ok) throw new Error('No fue posible cargar las entradas');
       const data = await response.json();
       const nextOrders = Array.isArray(data.orders) ? data.orders : [];
@@ -291,7 +292,7 @@ export const Orders: React.FC = () => {
       params.set('offset', String(currentOffset));
       if (statusFilter) params.set('status', statusFilter);
 
-      const response = await fetch(`/api/orders/outbound?${params.toString()}`);
+      const response = await fetch(`${API_BASE_URL}/api/orders/outbound?${params.toString()}`);
       if (!response.ok) throw new Error('No fue posible cargar las salidas');
       const data = await response.json();
       const nextOrders = Array.isArray(data.orders) ? data.orders : [];
@@ -351,7 +352,7 @@ export const Orders: React.FC = () => {
     setDetailLoading(true);
 
     try {
-      const response = await fetch(`/api/requests/inbound/${requestId}`);
+      const response = await fetch(`${API_BASE_URL}/api/requests/inbound/${requestId}`);
       if (!response.ok) throw new Error('No fue posible cargar el detalle de la entrada');
       const data = await response.json();
       const request = data.request || null;
@@ -406,7 +407,7 @@ export const Orders: React.FC = () => {
 
   const loadLocationOptions = async () => {
     try {
-      const response = await fetch('/api/scrap/location-options');
+      const response = await fetch(`${API_BASE_URL}/api/scrap/location-options`);
       if (!response.ok) return null;
       const data = await response.json();
       const nextSourceLocations = Array.isArray(data.sourceLocations) ? data.sourceLocations : [];
@@ -479,7 +480,7 @@ export const Orders: React.FC = () => {
     if (isOutbound) return;
     setAvailableLotsLoading(true);
     try {
-      const response = await fetch('/api/requests/lots?limit=20');
+      const response = await fetch(`${API_BASE_URL}/api/requests/lots?limit=20`);
       if (!response.ok) throw new Error('No fue posible cargar los lotes disponibles');
       const data = await response.json();
       setAvailableLots(Array.isArray(data.lots) ? data.lots : []);
@@ -506,7 +507,7 @@ export const Orders: React.FC = () => {
     setLotLookupLoading(true);
     setError('');
     try {
-      const response = await fetch(`/api/requests/lots?lotReference=${encodeURIComponent(lotInput.trim())}`);
+      const response = await fetch(`${API_BASE_URL}/api/requests/lots?lotReference=${encodeURIComponent(lotInput.trim())}`);
       if (!response.ok) throw new Error('No fue posible consultar el lote');
       const data = await response.json();
       const matches = Array.isArray(data.lots) ? data.lots : [];
@@ -538,7 +539,7 @@ export const Orders: React.FC = () => {
     setDetailLoading(true);
 
     try {
-      const response = await fetch(`/api/orders/outbound/${order.ShipmentID}`);
+      const response = await fetch(`${API_BASE_URL}/api/orders/outbound/${order.ShipmentID}`);
       if (!response.ok) throw new Error('No fue posible cargar el detalle de la salida');
       const data = await response.json();
       setSelectedOutboundOrder({ ...order, ...(data.order || {}) });

@@ -6,6 +6,7 @@ import useAuthStore from '../store/useAuthStore';
 import { motion } from 'framer-motion';
 import { useLocation } from 'react-router-dom';
 import { notifyAppRefresh, useAppRefresh } from '../utils/realtime';
+import { API_BASE_URL } from '../utils/apiBase';
 
 type Req = {
   RequestID: number;
@@ -88,7 +89,7 @@ export const Transfers: React.FC = () => {
     // If not found in current list, try fetching single request by id (supports consumption requests redirected from Salidas)
     (async () => {
       try {
-        const res = await fetch(`/api/requests/${requestId}`);
+        const res = await fetch(`${API_BASE_URL}/api/requests/${requestId}`);
         if (!res.ok) return;
         const data = await res.json();
         const req = data.request;
@@ -116,7 +117,7 @@ export const Transfers: React.FC = () => {
 
   async function loadLocationNames() {
     try {
-      const r = await fetch('/api/scrap/location-options');
+      const r = await fetch(`${API_BASE_URL}/api/scrap/location-options`);
       const d = await r.json();
       const nextMap: Record<number, string> = {};
       const options = Array.isArray(d.sourceLocations) ? d.sourceLocations : [];
@@ -135,7 +136,7 @@ export const Transfers: React.FC = () => {
   // debe pasar por el selector de rack, no solo cuando el nombre contiene literalmente "purg".
   async function loadQuarantineLocationIds() {
     try {
-      const r = await fetch('/api/scrap/quarantine-locations');
+      const r = await fetch(`${API_BASE_URL}/api/scrap/quarantine-locations`);
       const d = await r.json();
       const ids = Array.isArray(d.locations) ? d.locations.map((loc: any) => Number(loc.LocationID)) : [];
       setQuarantineLocationIds(new Set(ids));
@@ -154,7 +155,7 @@ export const Transfers: React.FC = () => {
     try {
       const traceabilityByPart = await Promise.all(uniqueParts.map(async (partNumber) => {
         try {
-          const r = await fetch(`/api/requests/lots?partNumber=${encodeURIComponent(partNumber)}&limit=50`);
+          const r = await fetch(`${API_BASE_URL}/api/requests/lots?partNumber=${encodeURIComponent(partNumber)}&limit=50`);
           if (!r.ok) return { partNumber, lots: [] as LotTraceability[] };
           const d = await r.json();
           return { partNumber, lots: Array.isArray(d?.lots) ? d.lots : [] as LotTraceability[] };
@@ -198,7 +199,7 @@ export const Transfers: React.FC = () => {
     try {
       await Promise.all([loadLocationNames(), loadQuarantineLocationIds()]);
       // Solo se ejecutan transferencias ya aprobadas por el ERP (estado 41) y de tipos transferibles para salidas/transferencias
-      const r = await fetch('/api/requests?status=41');
+      const r = await fetch(`${API_BASE_URL}/api/requests?status=41`);
       const d = await r.json();
       const nextRequests = ((d.requests || []) as Req[]).filter((req) => [2, 3, 6, 12].includes(Number(req.RequestTypeID || 0)));
       setRequests(nextRequests);
@@ -297,7 +298,7 @@ export const Transfers: React.FC = () => {
   async function loadStorageLocations() {
     setLoadingStorageLocations(true);
     try {
-      const response = await fetch('/api/storage-locations?limit=500');
+      const response = await fetch(`${API_BASE_URL}/api/storage-locations?limit=500`);
       if (!response.ok) throw new Error('No fue posible cargar las ubicaciones de rack');
       const data = await response.json();
       setStorageLocations(Array.isArray(data.locations) ? data.locations : []);
@@ -340,7 +341,7 @@ export const Transfers: React.FC = () => {
 
     try {
       setCompletingRack(rackRequest.RequestID);
-      const r = await fetch(`/api/requests/${rackRequest.RequestID}/complete-storage-transfer`, {
+      const r = await fetch(`${API_BASE_URL}/api/requests/${rackRequest.RequestID}/complete-storage-transfer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -397,7 +398,7 @@ export const Transfers: React.FC = () => {
       // sola operación atómica: si cualquier parte falla, el backend revierte
       // todo y la solicitud queda intacta en su estado anterior.
       const r = await fetch(
-        `/api/requests/${currentRequest.RequestID}/execute-transfer`,
+        `${API_BASE_URL}/api/requests/${currentRequest.RequestID}/execute-transfer`,
         {
           method: 'POST',
           headers: {

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Settings2, Check, LoaderCircle } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
+import { API_BASE_URL } from '../utils/apiBase';
 
 type AdjustmentItem = {
   RequestID: number;
@@ -36,7 +37,7 @@ export const Adjustments: React.FC = () => {
       setLoading(true);
       setError('');
       try {
-        const res = await fetch('/api/requests?status=41&limit=200');
+        const res = await fetch(`${API_BASE_URL}/api/requests?status=41&limit=200`);
         if (!res.ok) throw new Error('Error cargando ajustes');
         const data = await res.json();
         const items = Array.isArray(data.requests) ? data.requests : [];

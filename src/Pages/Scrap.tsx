@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { API_BASE_URL } from '../utils/apiBase';
 import {
   Trash2,
   Scan,
@@ -141,7 +142,7 @@ export const Scrap: React.FC = () => {
         setHistoryLoading(true);
         setHistoryError('');
       }
-      const response = await fetch(`/api/scrap/requests?page=${page}&status=${status}`);
+      const response = await fetch(`${API_BASE_URL}/api/scrap/requests?page=${page}&status=${status}`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.message || 'No se pudieron cargar las solicitudes de scrap.');
       setHistoryRequests(Array.isArray(data.requests) ? data.requests : []);
@@ -162,7 +163,7 @@ export const Scrap: React.FC = () => {
         setQuarantineLocationsLoading(true);
         setQuarantineLocationsError('');
       }
-      const response = await fetch('/api/scrap/quarantine-locations');
+      const response = await fetch(`${API_BASE_URL}/api/scrap/quarantine-locations`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.message || 'No se pudieron cargar las ubicaciones de cuarentena.');
       setQuarantineLocations(Array.isArray(data.locations) ? data.locations : []);
@@ -180,7 +181,7 @@ export const Scrap: React.FC = () => {
     try {
       setQuarantineLotsLoading(true);
       setQuarantineLotsError('');
-      const response = await fetch(`/api/scrap/quarantine-locations/${locationId}/lots?page=${page}`);
+      const response = await fetch(`${API_BASE_URL}/api/scrap/quarantine-locations/${locationId}/lots?page=${page}`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.message || 'No se pudieron cargar los lotes de la ubicación.');
       setQuarantineLots(Array.isArray(data.lots) ? data.lots : []);
@@ -267,7 +268,7 @@ export const Scrap: React.FC = () => {
     try {
       setIsScanning(true);
       setScanError('');
-      const response = await fetch(`/api/scrap/lookup?code=${encodeURIComponent(code)}`);
+      const response = await fetch(`${API_BASE_URL}/api/scrap/lookup?code=${encodeURIComponent(code)}`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.message || 'No se encontró el producto ni el lote con esa referencia.');
       openLotActions(data as LookupResult);
@@ -303,7 +304,7 @@ export const Scrap: React.FC = () => {
     try {
       setIsSubmitting(true);
       setFormError('');
-      const response = await fetch('/api/requests', {
+      const response = await fetch(`${API_BASE_URL}/api/requests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -343,7 +344,7 @@ export const Scrap: React.FC = () => {
     try {
       setIsSubmitting(true);
       setFormError('');
-      const response = await fetch('/api/requests', {
+      const response = await fetch(`${API_BASE_URL}/api/requests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -386,7 +387,7 @@ export const Scrap: React.FC = () => {
     try {
       setIsSubmitting(true);
       setFormError('');
-      const response = await fetch('/api/requests', {
+      const response = await fetch(`${API_BASE_URL}/api/requests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

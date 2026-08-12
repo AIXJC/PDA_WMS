@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { 
-  ArrowDownCircle, 
+import { API_BASE_URL } from '../utils/apiBase';
+import {
+  ArrowDownCircle,
   ArrowUpCircle, 
   Package, 
   Trash2, 
@@ -54,7 +55,7 @@ export const Dashboard: React.FC = () => {
       if (showLoading) {
         setLoading(true);
       }
-      const response = await fetch('/api/dashboard');
+      const response = await fetch(`${API_BASE_URL}/api/dashboard`);
       if (!response.ok) throw new Error('No fue posible cargar el dashboard');
       const data = await response.json();
       setDashboardData(data);
@@ -74,7 +75,7 @@ export const Dashboard: React.FC = () => {
       if (showLoading) {
         setActivitiesLoading(true);
       }
-      const response = await fetch('/api/activity-history?limit=3');
+      const response = await fetch(`${API_BASE_URL}/api/activity-history?limit=3`);
       if (!response.ok) throw new Error('No fue posible cargar la actividad reciente');
       const data = await response.json();
       setRecentActivities(Array.isArray(data.activities) ? data.activities : []);

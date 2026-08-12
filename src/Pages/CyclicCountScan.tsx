@@ -4,6 +4,7 @@ import { ArrowLeft, LoaderCircle, Check, AlertTriangle, XCircle, ScanLine } from
 import { Layout } from '../Components/Layout';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as mobileFeatures from '../utils/mobileFeatures';
+import { API_BASE_URL } from '../utils/apiBase';
 
 interface CycleDetail {
   CycleCountID: number;
@@ -51,7 +52,7 @@ export const CyclicCountScan: React.FC = () => {
     setLoadingCycle(true);
     setLoadError('');
     try {
-      const res = await fetch(`/api/cyclic-count/${id}`);
+      const res = await fetch(`${API_BASE_URL}/api/cyclic-count/${id}`);
       if (!res.ok) throw new Error('No se pudo cargar el conteo cíclico');
       const data = await res.json();
       setCycle(data.cycle ?? null);
@@ -80,7 +81,7 @@ export const CyclicCountScan: React.FC = () => {
     setIsProcessing(true);
 
     try {
-      const res = await fetch(`/api/cyclic-count/${id}/scan`, {
+      const res = await fetch(`${API_BASE_URL}/api/cyclic-count/${id}/scan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ batch: trimmed }),

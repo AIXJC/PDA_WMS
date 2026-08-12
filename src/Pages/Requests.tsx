@@ -6,6 +6,7 @@ import { useTranslation } from '../utils/translations';
 import { motion, AnimatePresence } from 'framer-motion';
 import useAuthStore from '../store/useAuthStore';
 import { notifyAppRefresh, useAppRefresh } from '../utils/realtime';
+import { API_BASE_URL } from '../utils/apiBase';
 
 type RequestItem = {
   RequestID: number;
@@ -170,7 +171,7 @@ export const Requests: React.FC = () => {
 
   async function loadLocationNames() {
     try {
-      const r = await fetch('/api/scrap/location-options');
+      const r = await fetch(`${API_BASE_URL}/api/scrap/location-options`);
       const d = await r.json();
       const nextMap: LocationMap = {};
       const sourceLocations = Array.isArray(d.sourceLocations) ? d.sourceLocations : [];
@@ -289,7 +290,7 @@ export const Requests: React.FC = () => {
 
   async function loadRequestTypes() {
     try {
-      const r = await fetch('/api/request-types');
+      const r = await fetch(`${API_BASE_URL}/api/request-types`);
       const d = await r.json();
       const allTypes = Array.isArray(d.requestTypes) ? d.requestTypes : [];
       // Exclude consumption-type and the unsupported PDA request types from the general Requests UI
@@ -314,7 +315,7 @@ export const Requests: React.FC = () => {
 
   async function loadLots() {
     try {
-      const r = await fetch('/api/requests/lots?limit=50');
+      const r = await fetch(`${API_BASE_URL}/api/requests/lots?limit=50`);
       const d = await r.json();
       setLots(Array.isArray(d.lots) ? d.lots : []);
     } catch (e) {
@@ -325,7 +326,7 @@ export const Requests: React.FC = () => {
 
   async function loadLotInventoryOptions() {
     try {
-      const r = await fetch('/api/requests/lots?limit=100');
+      const r = await fetch(`${API_BASE_URL}/api/requests/lots?limit=100`);
       const d = await r.json();
       const nextOptions = Array.isArray(d.lots)
         ? d.lots
@@ -354,7 +355,7 @@ export const Requests: React.FC = () => {
 
   async function loadInventoryOptions() {
     try {
-      const r = await fetch('/api/inventory?limit=500');
+      const r = await fetch(`${API_BASE_URL}/api/inventory?limit=500`);
       const d = await r.json();
       const nextOptions = Array.isArray(d.inventory) ? d.inventory : [];
       setInventoryOptions(nextOptions);
@@ -376,7 +377,7 @@ export const Requests: React.FC = () => {
     }
     try {
       await Promise.all([loadLocationNames(), loadRequestTypes(), loadLots(), loadLotInventoryOptions(), loadInventoryOptions()]);
-      const r = await fetch('/api/requests?limit=100');
+      const r = await fetch(`${API_BASE_URL}/api/requests?limit=100`);
       const d = await r.json();
       const all = Array.isArray(d.requests) ? d.requests : [];
       // Remove requests that are handled by the Salidas module and those that should not appear in the PDA Requests UI
@@ -453,7 +454,7 @@ export const Requests: React.FC = () => {
         LotInventoryID: (selectedRequestTypeId === 2 || selectedRequestTypeId === 3 || selectedRequestTypeId === 12) && selectedLotInventory?.LotInventoryID ? Number(selectedLotInventory.LotInventoryID) : undefined,
       };
 
-      const r = await fetch('/api/requests', {
+      const r = await fetch(`${API_BASE_URL}/api/requests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -467,7 +468,7 @@ export const Requests: React.FC = () => {
       // todavía no se sincronizó, para no duplicar la llamada al ERP.
       if (!d.erp) {
         const responseERP = await fetch(
-          '/api/erp/create-stock-entry',
+          `${API_BASE_URL}/api/erp/create-stock-entry`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

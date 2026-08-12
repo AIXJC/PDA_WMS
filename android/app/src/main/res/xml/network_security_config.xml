@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Permite trafico HTTP (no HTTPS) hacia cualquier host: el backend de esta app corre
+  en HTTP plano y su direccion todavia cambia mientras se prueba en local. Android
+  bloquea cleartext por default a partir de targetSdkVersion 28+ (este proyecto usa
+  33, ver android/variables.gradle), asi que sin esto la app compilada no podria
+  llamar a la API en absoluto.
+
+  TODO: una vez que el backend tenga una direccion final (o pase a HTTPS), acotar
+  esto a un <domain-config> con ese host especifico en vez del <base-config> global.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

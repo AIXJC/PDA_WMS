@@ -4,6 +4,7 @@ import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
 import { motion } from 'framer-motion';
 import { useAppRefresh } from '../utils/realtime';
+import { API_BASE_URL } from '../utils/apiBase';
 
 interface HistoryItem {
   id: string;
@@ -47,7 +48,7 @@ export const HistoryPage: React.FC = () => {
       if (showLoading) {
         setError('');
       }
-      const response = await fetch('/api/activity-history?limit=100');
+      const response = await fetch(`${API_BASE_URL}/api/activity-history?limit=100`);
       if (!response.ok) throw new Error('No fue posible cargar el historial');
       const data = await response.json();
       setHistoryItems(Array.isArray(data.activities) ? data.activities : []);

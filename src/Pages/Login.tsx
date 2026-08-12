@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { 
-  Lock, 
+import { API_BASE_URL } from '../utils/apiBase';
+import {
+  Lock,
   User, 
   QrCode, 
   ChevronRight,
@@ -59,7 +60,7 @@ export const Login: React.FC = () => {
     setIsLoading(true);
     setError('');
     try {
-      const resp = await fetch('/api/auth/login', {
+      const resp = await fetch(`${API_BASE_URL}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identifier: username, password }),
@@ -105,7 +106,7 @@ export const Login: React.FC = () => {
     setConfigError('');
     setIsConfigLoading(true);
     try {
-      const resp = await fetch('/api/server-config/auth', {
+      const resp = await fetch(`${API_BASE_URL}/api/server-config/auth`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: adminPassword }),
@@ -138,7 +139,7 @@ export const Login: React.FC = () => {
     setConfigError('');
     setIsConfigLoading(true);
     try {
-      const resp = await fetch('/api/server-config', {
+      const resp = await fetch(`${API_BASE_URL}/api/server-config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: adminPassword, values: serverConfig }),

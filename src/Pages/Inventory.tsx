@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useLocation } from 'react-router-dom';
+import { API_BASE_URL } from '../utils/apiBase';
 import {
   Search,
   ChevronRight,
@@ -68,7 +69,7 @@ export const Inventory: React.FC = () => {
       q.set('limit', String(PAGE_SIZE));
       q.set('offset', String(currentOffset));
       if (search) q.set('search', search);
-      const response = await fetch(`/api/inventory?${q.toString()}`);
+      const response = await fetch(`${API_BASE_URL}/api/inventory?${q.toString()}`);
       if (!response.ok) {
         throw new Error('No fue posible cargar el inventario');
       }
@@ -126,7 +127,7 @@ export const Inventory: React.FC = () => {
   const openDetail = async (item: InventoryRow) => {
     try {
       setSelectedLoading(true);
-      const response = await fetch(`/api/inventory/id/${item.inventoryId}`);
+      const response = await fetch(`${API_BASE_URL}/api/inventory/id/${item.inventoryId}`);
       if (!response.ok) throw new Error('No fue posible cargar el detalle');
       const data = await response.json();
       setSelectedItem(data.inventory || item);

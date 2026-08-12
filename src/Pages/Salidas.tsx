@@ -6,6 +6,7 @@ import { useTranslation } from '../utils/translations';
 import { motion, AnimatePresence } from 'framer-motion';
 import useAuthStore from '../store/useAuthStore';
 import { notifyAppRefresh } from '../utils/realtime';
+import { API_BASE_URL } from '../utils/apiBase';
 
 type RequestItem = {
   RequestID: number;
@@ -53,7 +54,7 @@ export const Salidas: React.FC = () => {
 
   async function resolveDefaults() {
     try {
-      const r = await fetch('/api/scrap/location-options');
+      const r = await fetch(`${API_BASE_URL}/api/scrap/location-options`);
       const d = await r.json();
       const locations = Array.isArray(d.availableLocations)
         ? d.availableLocations
@@ -84,7 +85,7 @@ export const Salidas: React.FC = () => {
     try {
       await resolveDefaults();
       // find consumption request type
-      const rt = await fetch('/api/request-types');
+      const rt = await fetch(`${API_BASE_URL}/api/request-types`);
       const rtd = await rt.json();
       const types = Array.isArray(rtd.requestTypes) ? rtd.requestTypes : [];
       const consumption = types.find((t: any) => {
@@ -107,7 +108,7 @@ export const Salidas: React.FC = () => {
         params.set('status', statusFilter);
       }
 
-      const res = await fetch(`/api/requests?${params.toString()}`);
+      const res = await fetch(`${API_BASE_URL}/api/requests?${params.toString()}`);
       const d = await res.json();
       const all = Array.isArray(d.requests) ? d.requests : [];
       const filtered = all.filter((rq: any) => [40, 41, 42, 43].includes(Number(rq.RequestStatusID || 0)));
@@ -139,7 +140,7 @@ export const Salidas: React.FC = () => {
     setRackInventoryError(null);
     setLotSearchPerformed(true);
     try {
-      const res = await fetch(`/api/inventory/${encodeURIComponent(normalized)}`);
+      const res = await fetch(`${API_BASE_URL}/api/inventory/${encodeURIComponent(normalized)}`);
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.message || 'No fue posible cargar el inventario por rack');
@@ -154,7 +155,7 @@ export const Salidas: React.FC = () => {
       // load lots for this part and keep only those currently in Storage (backend sets inStorage)
       try {
         setLoadingLots(true);
-        const lr = await fetch(`/api/requests/lots?partNumber=${encodeURIComponent(normalized)}&limit=50`);
+        const lr = await fetch(`${API_BASE_URL}/api/requests/lots?partNumber=${encodeURIComponent(normalized)}&limit=50`);
         const ld = await lr.json();
         const allLots = Array.isArray(ld.lots) ? ld.lots : [];
         setLots(allLots.filter((l: any) => !!l.inStorage));
@@ -237,7 +238,7 @@ export const Salidas: React.FC = () => {
       }
       if (defaultDestinationLocationId) payload.DestinationLocationID = defaultDestinationLocationId;
 
-      const r = await fetch('/api/requests', {
+      const r = await fetch(`${API_BASE_URL}/api/requests`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       });
       const d = await r.json();
@@ -522,7 +523,7 @@ export const Salidas: React.FC = () => {
                         const ref = String(scanLotText || '').trim();
                         if (!ref) return alert('Ingresa referencia de lote');
                         try {
-                          const r = await fetch(`/api/requests/lots?lotReference=${encodeURIComponent(ref)}&limit=20`);
+                          const r = await fetch(`${API_BASE_URL}/api/requests/lots?lotReference=${encodeURIComponent(ref)}&limit=20`);
                           const d = await r.json();
                           const lots = Array.isArray(d.lots) ? d.lots : [];
                           if (lots.length === 0) {
@@ -638,7 +639,7 @@ export const Salidas: React.FC = () => {
                                   setExpanded((s) => ({ ...s, [id]: !s[id] }));
                                   if (!stockMap[id] && part) {
                                     try {
-                                      const r = await fetch(`/api/inventory/${encodeURIComponent(part)}`);
+                                      const r = await fetch(`${API_BASE_URL}/api/inventory/${encodeURIComponent(part)}`);
                                       const d = await r.json();
                                       const locs = Array.isArray(d.locations) ? d.locations : [];
                                       setStockMap((s) => ({ ...s, [id]: locs }));
@@ -743,7 +744,7 @@ export const Salidas: React.FC = () => {
                                       setExpanded((s) => ({ ...s, [id]: !s[id] }));
                                       if (!stockMap[id] && part) {
                                         try {
-                                          const r = await fetch(`/api/inventory/${encodeURIComponent(part)}`);
+                                          const r = await fetch(`${API_BASE_URL}/api/inventory/${encodeURIComponent(part)}`);
                                           const d = await r.json();
                                           const locs = Array.isArray(d.locations) ? d.locations : [];
                                           setStockMap((s) => ({ ...s, [id]: locs }));

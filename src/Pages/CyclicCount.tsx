@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Check, RefreshCw, X, AlertCircle, LoaderCircle, ChevronLeft, ChevronRight, ScanLine } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
+import { API_BASE_URL } from '../utils/apiBase';
 
 interface CycleCount {
   CycleCountID: number;
@@ -98,7 +99,7 @@ export const CyclicCount: React.FC = () => {
     setError('');
     try {
       const statusParam = statusFilter === 'all' ? '46,47,48,49' : String(statusFilter);
-      const res = await fetch(`/api/cyclic-count?status=${statusParam}&page=${page}&limit=${PAGE_SIZE}`);
+      const res = await fetch(`${API_BASE_URL}/api/cyclic-count?status=${statusParam}&page=${page}&limit=${PAGE_SIZE}`);
       if (!res.ok) throw new Error('Error cargando conteos cíclicos');
       const data = await res.json();
       setCycles(Array.isArray(data.cycles) ? data.cycles : []);
