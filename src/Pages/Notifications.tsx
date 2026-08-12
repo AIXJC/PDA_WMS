@@ -1,7 +1,10 @@
 import React from 'react';
-import { Bell, Check, AlertCircle, Clock } from 'lucide-react';
+import { Bell, Check, AlertCircle, Clock, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Layout } from '../Components/Layout';
 import { motion } from 'framer-motion';
+
+const CLEARED_AT_STORAGE_KEY = 'pda-notifications-cleared-at';
+const PAGE_SIZE = 10;
 
 const formatTime = (timestamp) => {
   if (!timestamp) return '';
@@ -11,12 +14,21 @@ const formatTime = (timestamp) => {
 export const Notifications: React.FC = () => {
   const [notifications, setNotifications] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
+  const [page, setPage] = React.useState(1);
+  // No existe una tabla de notificaciones real con estado leído/no leído: se sintetizan
+  // en vivo a partir de recepciones y movimientos. "Marcar todo" guarda localmente (por
+  // dispositivo) el momento en que se limpiaron, para no volver a mostrar lo anterior a
+  // esa fecha en este mismo equipo.
+  const [clearedAt, setClearedAt] = React.useState(() => {
+    const stored = localStorage.getItem(CLEARED_AT_STORAGE_KEY);
+    return stored ? Number(stored) : 0;
+  });
 
   React.useEffect(() => {
     const loadNotifications = async () => {
       setLoading(true);
       try {
-        const response = await fetch('/api/notifications?limit=20');
+        const response = await fetch('/api/notifications?limit=100');
         if (!response.ok) throw new Error('No fue posible cargar las notificaciones');
         const data = await response.json();
         setNotifications(Array.isArray(data.notifications) ? data.notifications : []);
@@ -31,7 +43,20 @@ export const Notifications: React.FC = () => {
     loadNotifications();
   }, []);
 
-  const unreadCount = notifications.length;
+  const visibleNotifications = notifications.filter((notif) => {
+    const ts = notif.timestamp ? new Date(notif.timestamp).getTime() : 0;
+    return ts > clearedAt;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(visibleNotifications.length / PAGE_SIZE));
+  const pagedNotifications = visibleNotifications.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  const handleMarkAllRead = () => {
+    const now = Date.now();
+    localStorage.setItem(CLEARED_AT_STORAGE_KEY, String(now));
+    setClearedAt(now);
+    setPage(1);
+  };
 
   const getIcon = (type) => {
     if (type === 'alert') return <AlertCircle size={24} />;
@@ -59,21 +84,28 @@ export const Notifications: React.FC = () => {
       <div className="space-y-4">
         <div className="flex justify-between items-center px-2">
           <p className="text-xs font-bold text-slate-500 uppercase">
-            {loading ? 'Cargando...' : unreadCount > 0 ? `${unreadCount} notificaciones` : 'No hay notificaciones'}
+            {loading ? 'Cargando...' : visibleNotifications.length > 0 ? `${visibleNotifications.length} notificaciones` : 'No hay notificaciones'}
           </p>
-          <button className="text-xs font-bold text-blue-600 uppercase">Marcar todo</button>
+          <button
+            type="button"
+            onClick={handleMarkAllRead}
+            disabled={loading || visibleNotifications.length === 0}
+            className="text-xs font-bold text-blue-600 uppercase disabled:opacity-40"
+          >
+            Marcar todo
+          </button>
         </div>
 
         {loading ? (
           <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6 text-sm text-slate-500 text-center">
             Cargando notificaciones...
           </div>
-        ) : notifications.length === 0 ? (
+        ) : visibleNotifications.length === 0 ? (
           <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6 text-sm text-slate-500 text-center">
             No hay notificaciones recientes.
           </div>
         ) : (
-          notifications.map((notif, index) => (
+          pagedNotifications.map((notif, index) => (
             <motion.div
               key={notif.id}
               initial={{ opacity: 0, y: 10 }}
@@ -102,6 +134,30 @@ export const Notifications: React.FC = () => {
               </div>
             </motion.div>
           ))
+        )}
+
+        {!loading && visibleNotifications.length > 0 && (
+          <div className="flex items-center justify-between pt-2">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+            >
+              <ChevronLeft size={14} />
+              Anterior
+            </button>
+            <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">Página {page} de {totalPages}</span>
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+              className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-black uppercase tracking-widest text-slate-600 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+            >
+              Siguiente
+              <ChevronRight size={14} />
+            </button>
+          </div>
         )}
       </div>
     </Layout>

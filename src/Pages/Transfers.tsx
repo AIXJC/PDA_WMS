@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Layout } from '../Components/Layout';
 import { useTranslation } from '../utils/translations';
-import { Check, ArrowRight, X, Box, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Check, ArrowRight, X, Box, ChevronLeft, ChevronRight, Search } from 'lucide-react';
 import useAuthStore from '../store/useAuthStore';
 import { motion } from 'framer-motion';
 import { useLocation } from 'react-router-dom';
@@ -63,8 +63,13 @@ export const Transfers: React.FC = () => {
   const [page, setPage] = useState(1);
   const PAGE_SIZE = 10;
   const [quarantineLocationIds, setQuarantineLocationIds] = useState<Set<number>>(new Set());
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [searchText, setSearchText] = useState('');
+  const [typeFilter, setTypeFilter] = useState<'all' | 'toStorage' | 'toQuarantine' | 'production' | 'scrap' | 'partial'>('all');
 
   useEffect(() => { void load(); }, []);
+
+  useEffect(() => { setPage(1); }, [searchText, typeFilter]);
 
   useAppRefresh(() => {
     void load(false);
@@ -231,8 +236,38 @@ export const Transfers: React.FC = () => {
     return locationNames[locationId] || `#${locationId}`;
   };
 
-  const totalPages = Math.max(1, Math.ceil(requests.length / PAGE_SIZE));
-  const pagedRequests = requests.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  // Agrupa cada solicitud por lo que representa físicamente para el operador, no solo
+  // por RequestTypeID crudo: una transferencia completa (2) puede ir hacia Storage
+  // (Incoming/cuarentena -> almacén) o hacia cuarentena (almacén -> Purgue), y son
+  // operaciones muy distintas aunque compartan el mismo tipo.
+  const TYPE_FILTERS: { value: typeof typeFilter; label: string }[] = [
+    { value: 'all', label: 'Todos' },
+    { value: 'toStorage', label: 'Hacia almacén' },
+    { value: 'toQuarantine', label: 'Almacén → Cuarentena' },
+    { value: 'production', label: 'Almacén → Producción' },
+    { value: 'partial', label: 'Transferencia parcial' },
+    { value: 'scrap', label: 'Scrap / Baja' },
+  ];
+
+  const getTransferGroup = (req: Req): typeof typeFilter => {
+    const typeId = Number(req.RequestTypeID);
+    if (typeId === 6) return 'scrap';
+    if (typeId === 12) return 'partial';
+    if (typeId === 3) return 'production';
+    if (typeId === 2) return requiresRackSelection(req) ? 'toStorage' : 'toQuarantine';
+    return 'all';
+  };
+
+  const filteredRequests = requests.filter((req) => {
+    if (typeFilter !== 'all' && getTransferGroup(req) !== typeFilter) return false;
+    const search = searchText.trim().toLowerCase();
+    if (!search) return true;
+    const haystack = `${req.PartNumber || ''} ${req.RequestName || ''} #${req.RequestID}`.toLowerCase();
+    return haystack.includes(search);
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filteredRequests.length / PAGE_SIZE));
+  const pagedRequests = filteredRequests.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   async function execute(req: Req) {
     setCurrentRequest(req);
@@ -320,7 +355,7 @@ export const Transfers: React.FC = () => {
       setRackRequest(null);
       notifyAppRefresh('action');
       await load(false);
-      alert('Transferencia a rack completada correctamente.');
+      setSuccessMessage('Transferencia a rack completada correctamente.');
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
     } finally {
@@ -385,11 +420,12 @@ export const Transfers: React.FC = () => {
         );
       }
 
+      const completionMessage = isScrapRequest(currentRequest) ? 'Baja confirmada correctamente.' : 'Transferencia confirmada correctamente.';
       setShowStorageModal(false);
+      setCurrentRequest(null);
       notifyAppRefresh('action');
       await load(false);
-
-      alert(isScrapRequest(currentRequest) ? 'Baja confirmada correctamente.' : 'Transferencia confirmada correctamente.');
+      setSuccessMessage(completionMessage);
 
     } catch (e) {
       const message =
@@ -404,6 +440,38 @@ export const Transfers: React.FC = () => {
   return (
     <Layout title={t('transfers.title')}>
       <div className="space-y-4">
+        {!loading && requests.length > 0 && (
+          <div className="space-y-3">
+            <div className="relative">
+              <Search size={16} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                placeholder="Buscar por producto o folio"
+                className="w-full rounded-2xl border border-slate-200 bg-white py-3 pl-11 pr-4 text-sm font-semibold text-slate-700 outline-none dark:border-slate-700 dark:bg-slate-800/95 dark:text-slate-100"
+              />
+            </div>
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-3 shadow-sm dark:border-slate-700 dark:bg-slate-800/95">
+              <div className="flex flex-wrap gap-2">
+                {TYPE_FILTERS.map((filter) => {
+                  const active = typeFilter === filter.value;
+                  return (
+                    <button
+                      key={filter.value}
+                      type="button"
+                      onClick={() => setTypeFilter(filter.value)}
+                      className={`rounded-full px-3 py-2 text-[11px] font-black uppercase tracking-[0.2em] transition-all ${active ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-200'}`}
+                    >
+                      {filter.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <div>Cargando...</div>
         ) : requests.length === 0 ? (
@@ -421,6 +489,10 @@ export const Transfers: React.FC = () => {
               </button>
             </div>
             <button onClick={() => window.location.href = '/requests'} className="text-xs text-slate-500 underline">Ir a Solicitudes</button>
+          </div>
+        ) : filteredRequests.length === 0 ? (
+          <div className="rounded-[2rem] border border-slate-200 bg-white p-6 text-center text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-800/95">
+            Ningún resultado coincide con el filtro seleccionado.
           </div>
         ) : (
           pagedRequests.map((r) => (
@@ -515,7 +587,7 @@ export const Transfers: React.FC = () => {
           ))
         )}
 
-        {!loading && requests.length > 0 && (
+        {!loading && filteredRequests.length > 0 && (
           <div className="flex items-center justify-between pt-2">
             <button
               type="button"
@@ -593,56 +665,17 @@ export const Transfers: React.FC = () => {
               </div>
             ) : null}
 
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-500/10 dark:text-amber-100">
-              Para salidas, no se requiere elegir un rack. El lote se mantiene en su ubicación actual y solo se descuenta la cantidad indicada en la solicitud.
-            </div>
-
             <div className="mt-4 space-y-2">
               <label className="text-xs font-black text-slate-500 dark:text-slate-300 uppercase ml-1">Cantidad a descontar</label>
-              {isScrapRequest(currentRequest) ? (
-                (() => {
-                  const maxQty = currentRequest
-                    ? (defaultTransferQtyByRequest[currentRequest.RequestID] ?? Number(currentRequest.Quantity || 0))
-                    : 0;
-                  const currentQty = Number(quantityInput) || 0;
-                  return (
-                    <>
-                      <div className="flex items-center gap-4 bg-slate-50 dark:bg-slate-900/70 p-2 rounded-2xl">
-                        <button
-                          type="button"
-                          onClick={() => setQuantityInput(String(Math.max(1, currentQty - 1)))}
-                          className="w-12 h-12 bg-white dark:bg-slate-700 rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-200 font-black text-xl active:scale-90 transition-all"
-                        >
-                          -
-                        </button>
-                        <div className="flex-1 text-center text-xl font-black text-slate-900 dark:text-slate-100">{currentQty}</div>
-                        <button
-                          type="button"
-                          onClick={() => setQuantityInput(String(Math.min(maxQty || currentQty, currentQty + 1)))}
-                          className="w-12 h-12 bg-white dark:bg-slate-700 rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-200 font-black text-xl active:scale-90 transition-all"
-                        >
-                          +
-                        </button>
-                      </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">
-                        La inspección de calidad puede determinar una baja parcial. Máximo disponible: {maxQty}.
-                      </p>
-                    </>
-                  );
-                })()
-              ) : (
-                <>
-                  <input
-                    type="number"
-                    min="0.0001"
-                    step="any"
-                    value={quantityInput}
-                    readOnly
-                    className="w-full bg-slate-100 dark:bg-slate-700 border-2 border-slate-200 dark:border-slate-600 rounded-xl py-3 px-4 font-medium text-slate-900 dark:text-slate-100 cursor-not-allowed"
-                  />
-                  <p className="text-xs text-slate-500 dark:text-slate-400">Se usa la cantidad registrada en la solicitud. No cambia la ubicación del lote cuando es una salida parcial.</p>
-                </>
-              )}
+              <input
+                type="number"
+                min="0.0001"
+                step="any"
+                value={quantityInput}
+                readOnly
+                className="w-full bg-slate-100 dark:bg-slate-700 border-2 border-slate-200 dark:border-slate-600 rounded-xl py-3 px-4 font-medium text-slate-900 dark:text-slate-100 cursor-not-allowed"
+              />
+              <p className="text-xs text-slate-500 dark:text-slate-400">Se usa la cantidad registrada en la solicitud. No cambia la ubicación del lote cuando es una salida parcial.</p>
             </div>
 
             <div className="mt-6 flex gap-3">
@@ -756,6 +789,34 @@ export const Transfers: React.FC = () => {
                 {completingRack !== null ? 'Completando...' : 'Marcar como completado'}
               </button>
             </div>
+          </motion.div>
+        </motion.div>
+      )}
+
+      {/* Pantalla de confirmación tras completar una acción, en vez de un alert() bloqueante */}
+      {successMessage && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+        >
+          <motion.div
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.9, opacity: 0 }}
+            className="flex w-full max-w-md flex-col items-center space-y-6 rounded-[2rem] bg-white p-8 text-center shadow-2xl dark:bg-slate-800"
+          >
+            <div className="flex h-24 w-24 items-center justify-center rounded-full bg-emerald-500 text-white shadow-2xl shadow-emerald-500/40">
+              <Check size={48} strokeWidth={3} />
+            </div>
+            <p className="font-medium text-slate-600 dark:text-slate-300">{successMessage}</p>
+            <button
+              onClick={() => setSuccessMessage(null)}
+              className="w-full rounded-[1.5rem] bg-slate-900 py-4 font-black uppercase tracking-widest text-white transition-all active:scale-95"
+            >
+              Continuar
+            </button>
           </motion.div>
         </motion.div>
       )}

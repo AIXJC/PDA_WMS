@@ -63,6 +63,7 @@ type LocationMap = Record<number, string>;
 
 export const Requests: React.FC = () => {
   const [showCreate, setShowCreate] = useState(false);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [requests, setRequests] = useState<RequestItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -491,7 +492,7 @@ export const Requests: React.FC = () => {
       setShowCreate(false);
       await loadRequests(false);
       notifyAppRefresh('action');
-      alert(`Solicitud creada correctamente #${d.requestId}`);
+      setSuccessMessage(`Solicitud creada correctamente #${d.requestId}`);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       alert(message);
@@ -551,7 +552,29 @@ export const Requests: React.FC = () => {
   return (
     <Layout title={t('requests.title')}>
       <AnimatePresence mode="wait">
-        {showCreate ? (
+        {successMessage ? (
+          <motion.div
+            key="success"
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0 }}
+            className="flex flex-col items-center justify-center space-y-8 py-12"
+          >
+            <div className="flex h-32 w-32 items-center justify-center rounded-full bg-emerald-500 text-white shadow-2xl shadow-emerald-500/40">
+              <Check size={64} strokeWidth={3} />
+            </div>
+            <div className="space-y-2 px-8 text-center">
+              <h2 className="text-2xl font-black text-slate-900 dark:text-slate-100">{t('requests.newRequest')}</h2>
+              <p className="font-medium text-slate-500 dark:text-slate-300">{successMessage}</p>
+            </div>
+            <button
+              onClick={() => setSuccessMessage(null)}
+              className="w-full max-w-xs rounded-[2rem] bg-slate-900 py-6 font-black uppercase tracking-widest text-white transition-all active:scale-95"
+            >
+              Continuar
+            </button>
+          </motion.div>
+        ) : showCreate ? (
           <motion.div
             key="create"
             initial={{ opacity: 0, x: 20 }}

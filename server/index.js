@@ -8,7 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import * as erpClient from "./erpClient.js";
 import { buildInboundTransferRequestPayload } from './receiptFlow.js';
-import { shouldApplyInventoryUpdate, canExecuteTransfer, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot } from './inventoryFlow.js';
+import { shouldApplyInventoryUpdate, canExecuteTransfer, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot, deleteInventoryRowIfEmpty } from './inventoryFlow.js';
 
 dotenv.config({ path: "server/.env" });
 dotenv.config();
@@ -4272,6 +4272,7 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
   let lotInternalLot = null;
   let movementId = null;
   let storageInventoryAdjustment = null;
+  let decrementedInventoryId = null;
 
   const connection = await pool.getConnection();
   try {
@@ -4340,9 +4341,11 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
 
     // El scrap (destino sentinel 0) no mueve la ubicación física del lote: solo se
     // descuenta CurrentQuantity (ver upsertInventoryFromLot). La transferencia parcial
-    // y el consumo (3, 12) tampoco mueven ubicación, solo descuentan cantidad.
-    const isPartialOutbound = [3, 6, 12].includes(requestTypeId);
-    if (!isPartialOutbound) {
+    // (12) tampoco mueve ubicación, solo descuenta cantidad, porque el resto del lote
+    // se queda en su rack original. La transferencia completa (2) y el consumo a
+    // producción (3) sí mueven el lote completo a su destino.
+    const movesLotLocation = [2, 3].includes(requestTypeId);
+    if (movesLotLocation) {
       await connection.query(
         'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
         [destinationLocationId, requestRow.LotInventoryID]
@@ -4388,6 +4391,9 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
         requestTypeId,
       });
       movementId = upsertResult?.movementId ?? null;
+      if (upsertResult?.applied && Number(upsertResult.quantity) < 0) {
+        decrementedInventoryId = upsertResult.inventoryId;
+      }
     }
 
     // Commit de todos los cambios locales ANTES de tocar el ERP. El ERP
@@ -4494,6 +4500,19 @@ const handleExecuteTransfer = asyncRoute(async (req, res) => {
 
   console.log(`[transfer] requestId=${requestId} statusAfter=42`);
 
+  // Ya no hay riesgo de reversión (el ERP confirmó): si alguno de los racks
+  // descontados arriba quedó en cero, se elimina para no dejar registros
+  // "fantasma" en MES_INVENTORY. Se hace después de la confirmación del ERP
+  // a propósito, para que una reversión compensatoria (si el ERP hubiera
+  // rechazado) siempre encuentre la fila todavía viva y solo tenga que sumar.
+  for (const inventoryId of new Set([storageInventoryAdjustment?.inventoryId, decrementedInventoryId].filter(Boolean))) {
+    try {
+      await deleteInventoryRowIfEmpty(pool, inventoryId);
+    } catch (cleanupError) {
+      console.error(`[transfer] No se pudo limpiar MES_INVENTORY InventoryID=${inventoryId}:`, cleanupError);
+    }
+  }
+
   res.json({
     ok: true,
     movementId,
@@ -4532,6 +4551,7 @@ async function reverseStorageTransferCompletion(connection, { requestId, lotInve
       'UPDATE MES_INVENTORY SET Quantity = Quantity - ?, LastUpdate = NOW() WHERE InventoryID = ?',
       [quantity, inventoryRows[0].InventoryID]
     );
+    await deleteInventoryRowIfEmpty(connection, inventoryRows[0].InventoryID);
   }
 
   await connection.query('DELETE FROM INVENTORY_MOVEMENTS_HISTORY WHERE MovementID = ?', [movement.MovementID]);

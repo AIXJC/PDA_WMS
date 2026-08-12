@@ -24,6 +24,21 @@ function getInventoryDelta(requestStatusId) {
   return 0;
 }
 
+// Un registro de MES_INVENTORY sin cantidad ya no representa material físico en ese
+// rack, así que se elimina en vez de dejarlo en cero: si más adelante vuelve a
+// entrar material a ese mismo rack se crea un registro nuevo (mismo patrón ya usado
+// para altas). Cualquier lote que todavía apunte a este InventoryID pierde esa
+// referencia (queda NULL) para no dejar una relación colgando.
+async function deleteInventoryRowIfEmpty(connection, inventoryId) {
+  if (!inventoryId) return false;
+  const [rows] = await connection.query('SELECT Quantity FROM MES_INVENTORY WHERE InventoryID = ?', [inventoryId]);
+  const row = rows[0];
+  if (!row || Number(row.Quantity) > 0) return false;
+  await connection.query('UPDATE MES_LOT_INVENTORY SET InventoryID = NULL WHERE InventoryID = ?', [inventoryId]);
+  await connection.query('DELETE FROM MES_INVENTORY WHERE InventoryID = ?', [inventoryId]);
+  return true;
+}
+
 async function upsertInventoryFromLot(connection, { requestId, lotInventoryId, partNumber, quantity, sourceLocationId, destinationLocationId, userId, comments, requestStatusId, requestTypeId }) {
   const lotId = Number(lotInventoryId);
   if (!Number.isInteger(lotId) || lotId <= 0) return { applied: false, reason: 'lot_inventory_missing' };
@@ -194,8 +209,9 @@ async function reverseSubmittedMovement(connection, { requestId, requestTypeId, 
   if (isScrapMovement) {
     await connection.query('DELETE FROM MES_SCRAP_AND_DISCREPANCIES WHERE MovementID = ?', [movement.MovementID]);
   } else {
-    // Solo la transferencia completa (no la parcial/consumo) mueve la ubicación del lote.
-    if (typeId === 2 && sourceLocationId != null) {
+    // Solo la transferencia completa y el consumo a producción mueven la ubicación
+    // del lote (la parcial no, ver upsertInventoryFromLot).
+    if ([2, 3].includes(typeId) && sourceLocationId != null) {
       await connection.query(
         'UPDATE MES_LOT_INVENTORY SET CurrentLocationID = ? WHERE LotInventoryID = ?',
         [sourceLocationId, lotInventoryId]
@@ -252,4 +268,4 @@ async function getStorageFromLot(connection, requestId) {
   return rows[0] || null;
 }
 
-export { shouldApplyInventoryUpdate, canExecuteTransfer, getInventoryDelta, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot };
+export { shouldApplyInventoryUpdate, canExecuteTransfer, getInventoryDelta, upsertInventoryFromLot, reverseSubmittedMovement, getStorageFromLot, deleteInventoryRowIfEmpty };
