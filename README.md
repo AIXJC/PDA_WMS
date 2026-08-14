@@ -57,30 +57,6 @@ El sistema está pensado para utilizarse directamente desde dispositivos PDA, pe
 
 ### 🎯 Enfoque
 
-```text
-        👷 OPERADOR
-             │
-             ▼
-        📱 PDA DEVICE
-             │
-             ▼
-       🔍 SCAN / INPUT
-             │
-             ▼
-       🧠 WMS SYSTEM
-             │
-       ┌─────┴─────┐
-       ▼           ▼
-   📦 INVENTORY   📋 ORDERS
-       │           │
-       └─────┬─────┘
-             ▼
-        🗄️ MARIADB
-             │
-             ▼
-        📊 REPORTS
-```
-
 ---
 
 # ✨ Main Features
@@ -124,7 +100,7 @@ La interfaz fue diseñada pensando en **dispositivos PDA y operación táctil**.
 
 ---
 
-# 🔍 BARCODE SCANNER
+# BARCODE SCANNER
 
 Uno de los componentes principales del sistema es el flujo de escaneo.
 
@@ -156,7 +132,7 @@ Permite utilizar el código de barras como punto de entrada para distintas opera
 
 ---
 
-# 📦 INVENTORY MANAGEMENT
+#  INVENTORY MANAGEMENT
 
 El módulo de inventario permite consultar y controlar información relacionada con:
 
@@ -190,7 +166,7 @@ El módulo de inventario permite consultar y controlar información relacionada 
 
 ---
 
-# 📥 INBOUND OPERATIONS
+#  INBOUND OPERATIONS
 
 ## Receiving & Incoming Orders
 
@@ -199,22 +175,22 @@ Gestión de órdenes y recepción de mercancía.
 ### Flujo
 
 ```text
-📋 ORDER
+ ORDER
    │
    ▼
-📥 INBOUND
+ INBOUND
    │
    ▼
-📦 RECEIVING
+ RECEIVING
    │
    ▼
-🔍 SCANNING
+ SCANNING
    │
    ▼
-📍 STORAGE
+ STORAGE
    │
    ▼
-🟢 INVENTORY UPDATED
+ INVENTORY UPDATED
 ```
 
 El backend soporta filtros por estado y paginación para las consultas de entradas.
