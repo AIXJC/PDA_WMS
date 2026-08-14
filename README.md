@@ -775,6 +775,6 @@ La evolución del proyecto está orientada hacia un ecosistema WMS más completo
 
 ## Licencia
 
-Copyright © 2026 Alexander J. Costilla.
+Copyright © 2026 Alexander J. Costilla x SOFTBANK.
 Todos los derechos reservados.
 
